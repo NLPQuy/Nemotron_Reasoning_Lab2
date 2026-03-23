@@ -232,6 +232,11 @@ if os.path.exists(_src):
     os.environ["TRITON_PTXAS_PATH"]           = _dst
     os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = _dst
     nv_compiler.get_ptxas_version = lambda arch="blackwell": "12.0"
+    # Also patch get_ptxas so .path is always valid
+    class _RealPtxas:
+        path    = _dst
+        version = "12.0"
+    nv_compiler.get_ptxas = lambda arch=None: _RealPtxas()
     print("  [triton] ptxas redirect applied.")
 else:
     print("  [triton] source binary not found — skipping.")
@@ -272,9 +277,14 @@ for _mod_name, _mod in list(sys.modules.items()):
         def _make_safe_gp(orig):
             def _safe_get_ptxas(arch):
                 try:
-                    return orig(arch)
+                    result = orig(arch)
+                    # Ensure .path is always set
+                    if not hasattr(result, "path") or result.path is None:
+                        result.path = "/tmp/ptxas-blackwell"
+                    return result
                 except Exception:
                     class _FakePtxas:
+                        path    = "/tmp/ptxas-blackwell"
                         version = "12.0"
                     return _FakePtxas()
             return _safe_get_ptxas
