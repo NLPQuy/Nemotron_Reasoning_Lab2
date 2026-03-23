@@ -43,7 +43,7 @@
 # -- Phase 0: Load a pre-trained adapter (from sft.py) instead of retraining --
 # Set this to skipping baseline SFT; e.g. "/kaggle/input/your-dataset/adapter"
 # or the path where sft.py saved its adapter. Set to None to train from scratch.
-PRETRAINED_ADAPTER_PATH = None  # e.g. "/kaggle/working/adapter"
+PRETRAINED_ADAPTER_PATH = "/kaggle/input/notebooks/emanuellcs/nvidia-nemotron-sft/adapter"  # e.g. "/kaggle/working/adapter"
 
 # -- Phase 1: Baseline SFT (skip if PRETRAINED_ADAPTER_PATH is set) ---------
 RUN_BASELINE_SFT = True
@@ -354,10 +354,24 @@ def cleanup_memory():
 
 
 def patch_mamba():
-    """Disable Mamba SSM fast-path (crashes on Blackwell sm_120)."""
-    for _name, _mod in sys.modules.items():
+    """Disable Mamba SSM fast-path AND re-patch rmsnorm_fn (crashes on Blackwell sm_120).
+
+    Must be called AFTER model loading: modeling_nemotron_h does
+    `from mamba_ssm... import rmsnorm_fn` which creates a local binding at import
+    time.  The startup patch only covers modules already in sys.modules, so we
+    re-scan here when the model (and its deps) are fully loaded.
+    """
+    patched = []
+    for _name, _mod in list(sys.modules.items()):
         if "modeling_nemotron_h" in _name:
             _mod.is_fast_path_available = False
+        # Replace Triton rmsnorm_fn with pure-PyTorch version in every module
+        # that holds a reference to it (including modeling_nemotron_h itself).
+        if hasattr(_mod, "rmsnorm_fn") and _mod.rmsnorm_fn is not _pure_rmsnorm_fn:
+            _mod.rmsnorm_fn = _pure_rmsnorm_fn
+            patched.append(_name)
+    if patched:
+        print(f"  [patch_mamba] rmsnorm_fn re-patched in: {patched}")
 
 
 def get_lora_config():
@@ -375,9 +389,18 @@ def get_lora_config():
 # ## 4. Data Loading & Tokenizer
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
-MODEL_PATH = kagglehub.model_download(
-    "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
-)
+# Use direct path (internet is disabled on Kaggle — kagglehub.model_download()
+# requires network to verify cache even when the model is already downloaded).
+_DIRECT_MODEL_PATH = "/kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1"
+if os.path.isdir(_DIRECT_MODEL_PATH):
+    MODEL_PATH = _DIRECT_MODEL_PATH
+    print(f"Using direct model path: {MODEL_PATH}")
+else:
+    import kagglehub
+    MODEL_PATH = kagglehub.model_download(
+        "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
+    )
+    print(f"Fallback via kagglehub: {MODEL_PATH}")
 
 train_df = pl.read_csv(
     "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge/train.csv"
@@ -537,6 +560,7 @@ if RUN_BASELINE_SFT:
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, device_map="auto", trust_remote_code=True, dtype=torch.bfloat16,
+        offload_folder="/tmp/offload",
     )
     patch_mamba()
 
@@ -702,6 +726,7 @@ if _needs_gen:
     # Load model + SFT adapter for generation
     gen_model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, device_map="auto", trust_remote_code=True, dtype=torch.bfloat16,
+        offload_folder="/tmp/offload",
     )
     patch_mamba()
     gen_model = PeftModel.from_pretrained(gen_model, OUTPUT_DIR_SFT)
@@ -765,6 +790,7 @@ if RUN_RFT:
     # Load base model + SFT adapter, continue training on RFT data
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, device_map="auto", trust_remote_code=True, dtype=torch.bfloat16,
+        offload_folder="/tmp/offload",
     )
     patch_mamba()
     model = PeftModel.from_pretrained(model, OUTPUT_DIR_SFT, is_trainable=True)
@@ -836,7 +862,7 @@ if RUN_STAR:
         else:
             iter_model = AutoModelForCausalLM.from_pretrained(
                 MODEL_PATH, device_map="auto", trust_remote_code=True,
-                dtype=torch.bfloat16,
+                dtype=torch.bfloat16, offload_folder="/tmp/offload",
             )
             patch_mamba()
             iter_model = PeftModel.from_pretrained(iter_model, current_adapter_path)
@@ -891,7 +917,7 @@ if RUN_STAR:
 
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH, device_map="auto", trust_remote_code=True,
-            dtype=torch.bfloat16,
+            dtype=torch.bfloat16, offload_folder="/tmp/offload",
         )
         patch_mamba()
         # Continue from previous iteration's adapter
@@ -995,6 +1021,7 @@ if RUN_SPIN:
     # Load base + SFT adapter for DPO training
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, device_map="auto", trust_remote_code=True, dtype=torch.bfloat16,
+        offload_folder="/tmp/offload",
     )
     patch_mamba()
     model = PeftModel.from_pretrained(model, OUTPUT_DIR_SFT, is_trainable=True)
@@ -1082,6 +1109,7 @@ if RUN_SELF_REWARD:
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, device_map="auto", trust_remote_code=True, dtype=torch.bfloat16,
+        offload_folder="/tmp/offload",
     )
     patch_mamba()
     model = PeftModel.from_pretrained(model, OUTPUT_DIR_SFT, is_trainable=True)
@@ -1200,6 +1228,7 @@ if RUN_GRPO:
     # Load model + adapter
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, device_map="auto", trust_remote_code=True, dtype=torch.bfloat16,
+        offload_folder="/tmp/offload",
     )
     patch_mamba()
     model = PeftModel.from_pretrained(model, grpo_base_adapter, is_trainable=True)
