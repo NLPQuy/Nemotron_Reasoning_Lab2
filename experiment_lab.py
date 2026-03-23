@@ -85,8 +85,8 @@ STAR_ITERATIONS    = 2     # Number of STaR iterations
 STAR_USE_RATIONAL  = True  # Use rationalization for failed prompts
 
 # -- GRPO-specific ----------------------------------------------------------
-GRPO_NUM_GENERATIONS = 4
-GRPO_MAX_COMPLETION  = 1024
+GRPO_NUM_GENERATIONS = 2      # Reduced from 4 → less KV-cache during generation
+GRPO_MAX_COMPLETION  = 512    # Reduced from 1024 → 2x less VRAM per generation step
 GRPO_KL_COEF         = 0.05
 GRPO_EPOCHS          = 1
 
@@ -291,6 +291,9 @@ for _mod_name, _mod in list(sys.modules.items()):
         _mod.get_ptxas = _make_safe_gp(_orig_gp)
 
 print("Blackwell patches done.")
+
+# Help allocator reuse fragmented blocks instead of OOM-ing
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # ## 3. Shared Utilities
@@ -730,8 +733,7 @@ if _needs_gen:
     )
     patch_mamba()
     gen_model = PeftModel.from_pretrained(gen_model, OUTPUT_DIR_SFT)
-    gen_model = gen_model.merge_and_unload()  # Merge for faster inference
-    print("SFT model loaded & merged for generation.")
+    print("SFT model loaded for generation.")
 
     gen_prompts = RAW_PROMPTS
     gen_answers = RAW_ANSWERS
@@ -866,7 +868,6 @@ if RUN_STAR:
             )
             patch_mamba()
             iter_model = PeftModel.from_pretrained(iter_model, current_adapter_path)
-            iter_model = iter_model.merge_and_unload()
 
             cache_path = f"/kaggle/working/star_gen_iter{iteration}.json"
             iter_results = generate_responses(
@@ -1173,6 +1174,9 @@ if RUN_GRPO:
     ) else OUTPUT_DIR_SFT
     print(f"Starting from adapter: {grpo_base_adapter}")
 
+    # Free any leftover memory from prior phases before loading 30B model
+    cleanup_memory()
+
     # Build GRPO dataset: prompts + ground truth for reward computation
     grpo_prompts = []
     grpo_answers = []
@@ -1240,6 +1244,8 @@ if RUN_GRPO:
         output_dir=grpo_output,
         num_generations=GRPO_NUM_GENERATIONS,
         max_completion_length=GRPO_MAX_COMPLETION,
+        max_prompt_length=512,    # Cap prompt size so prompt+completion fits in VRAM
+        temperature=0.7,          # Sampling temperature for generation
         per_device_train_batch_size=1,
         gradient_accumulation_steps=GRAD_ACCUM * 2,
         num_train_epochs=GRPO_EPOCHS,
