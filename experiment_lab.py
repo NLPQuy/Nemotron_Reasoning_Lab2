@@ -377,6 +377,19 @@ def patch_mamba():
         print(f"  [patch_mamba] rmsnorm_fn re-patched in: {patched}")
 
 
+def _strip_response_wrapper(response: str) -> str:
+    """Extract inner reasoning from a model response, removing <think> tags and \\boxed{}."""
+    text = response.strip()
+    # Remove <think> prefix
+    if text.startswith("<think>"):
+        text = text[len("<think>"):].strip()
+    # Remove everything from </think> onward (includes \boxed{...})
+    think_end = text.find("</think>")
+    if think_end >= 0:
+        text = text[:think_end].strip()
+    return text
+
+
 def get_lora_config():
     """Return the standard LoRA config for this competition."""
     return LoraConfig(
@@ -776,8 +789,8 @@ if RUN_RFT:
             continue
         # Pick the longest correct response (most detailed reasoning)
         best_response = max(r["correct_responses"], key=len)
-        # Format as training example using model's OWN CoT
-        text = format_sft_example(r["prompt"], r["answer"], cot_trace=best_response)
+        # Format as training example using model's OWN CoT (strip wrapper to avoid double <think>)
+        text = format_sft_example(r["prompt"], r["answer"], cot_trace=_strip_response_wrapper(best_response))
         rft_texts.append(text)
 
     print(f"RFT dataset: {len(rft_texts)} correct / {n_skipped} skipped")
@@ -884,10 +897,10 @@ if RUN_STAR:
 
         for r in iter_results:
             if r["correct_responses"]:
-                # Use the longest correct response
+                # Use the longest correct response (strip wrapper to avoid double <think>)
                 best = max(r["correct_responses"], key=len)
                 star_texts.append(format_sft_example(
-                    r["prompt"], r["answer"], cot_trace=best))
+                    r["prompt"], r["answer"], cot_trace=_strip_response_wrapper(best)))
                 n_correct += 1
             elif STAR_USE_RATIONAL:
                 # Rationalization: the model couldn't solve it, so we include
@@ -1244,8 +1257,6 @@ if RUN_GRPO:
         output_dir=grpo_output,
         num_generations=GRPO_NUM_GENERATIONS,
         max_completion_length=GRPO_MAX_COMPLETION,
-        max_prompt_length=512,    # Cap prompt size so prompt+completion fits in VRAM
-        temperature=0.7,          # Sampling temperature for generation
         per_device_train_batch_size=1,
         gradient_accumulation_steps=GRAD_ACCUM * 2,
         num_train_epochs=GRPO_EPOCHS,
