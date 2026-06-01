@@ -68,3 +68,15 @@ Per [nemotron-master/CLAUDE.md](nemotron-master/CLAUDE.md):
 - HTML changes are validated via the `puppeteer` MCP server (configured in `nemotron-master/.mcp.json`).
 
 The root `Continuer_Nemotron_Notebook.py` has no local `uv` project — it is meant to run on Kaggle or be launched against Modal (`modal run Continuer_Nemotron_Notebook.py`), not executed locally.
+
+## Experiment files (`exp<N>.py`)
+
+`exp1.py` through `exp10.py` at the repo root are **standalone experiment scripts** — each is a copy of `Continuer_Nemotron_Notebook.py` with exactly one idea from batch-1 applied. Changes are bracketed by `# >>> EXP<N> START` / `# >>> EXP<N> END` markers to make the diff obvious. They launch identically to the base script (`modal run exp<N>.py`). Each file's header comment names the batch idea, the knob changed, and the rollback instruction.
+
+## Experiment tracking
+
+When an experiment yields a leaderboard score:
+1. Copy `tracker/rounds/round_template.md` → `tracker/rounds/round_<N>.md` and fill in every field.
+2. Append the result row to `tracker/leaderboard.md`.
+
+Current state: **baseline 0.86** (pretrained adapter, default `Continuer_Nemotron_Notebook.py`). Target: **0.87**. All 10 exp files for batch-1 are already generated.
