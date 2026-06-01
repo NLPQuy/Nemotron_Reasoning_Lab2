@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Generated data / training artifacts from the vendored Nemotron pipeline.
+nemotron-master/augmentations/
+nemotron-master/corpus/
+nemotron-master/corpus.jsonl
+nemotron-master/generation.jsonl
+nemotron-master/investigations/
+nemotron-master/problems/
+nemotron-master/raw/
+nemotron-master/reasoning/
+nemotron-master/training/
