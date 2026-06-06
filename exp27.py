@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP27 — GSPO sequence-level policy objective  (Batch-3 Idea 8)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/trl/trl/trainer/grpo_trainer.py sequence importance weights | Knob: GSPO_ENABLE=True | Rollback: set GSPO_ENABLE=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -22,6 +27,28 @@ ORIGINAL_PROBLEMS_ONLY = (
 )
 SHUFFLE_DATASET = False
 
+# >>> EXP27 START
+import os
+
+GSPO_ENABLE = True
+GSPO_ROLLOUTS = os.environ.get("GSPO_ROLLOUTS", "/kaggle/working/rollouts.jsonl")
+GSPO_GROUP_SIZE = 8
+GSPO_TEMPERATURE = 0.9
+GSPO_TOP_P = 0.95
+GSPO_ROLLOUT_TRAIN_CSV = os.environ.get(
+    "GSPO_ROLLOUT_TRAIN_CSV",
+    os.environ.get(
+        "GSPO_TRAIN_CSV",
+        "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge/train.csv",
+    ),
+)
+GSPO_ONLY_CATEGORY = ""
+GSPO_MAX_PROBLEMS = 0
+GSPO_EPS_LOW = 3e-4
+GSPO_EPS_HIGH = 3e-4
+GSPO_BETA_KL = 0.0
+# <<< EXP27 END
+
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
 
@@ -39,6 +66,259 @@ TARGET_MODULES = [
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 import os
+
+# >>> EXP27 START
+PROMPT_SUFFIX = (
+    "\nPlease put your final answer inside `\\boxed{}`. "
+    "For example: `\\boxed{your answer}`"
+)
+
+
+def extract_answer(text: str) -> str:
+    """Extract the final boxed answer, matching nemotron-master/reasoning.py."""
+    import re
+
+    matches = re.findall(r"\\boxed\{([^}]*)(?:\}|$)", text)
+    if matches:
+        non_empty = [m.strip() for m in matches if m.strip()]
+        if non_empty:
+            return non_empty[-1]
+        return matches[-1].strip()
+    return ""
+
+
+def compare_answer(stored: str, pred: str) -> bool:
+    """Return whether a predicted answer matches the stored competition label."""
+    import re
+
+    stored = stored.strip()
+    pred = pred.strip()
+    if re.fullmatch(r"[01]+", stored):
+        return pred.lower() == stored.lower()
+    try:
+        stored_num = float(stored)
+        pred_num = float(pred)
+        if stored_num == 0:
+            return abs(pred_num) < 1e-2
+        return abs(stored_num - pred_num) / abs(stored_num) <= 1e-2
+    except ValueError:
+        return pred.lower() == stored.lower()
+
+
+def format_ok(text: str) -> bool:
+    """Basic guard against reward hacking malformed completions."""
+    import re
+
+    return len(re.findall(r"\\boxed\{", text)) >= 1
+
+
+def _sampled_token_logprob(logprob_row: object, token_id: int) -> float:
+    """Extract vLLM's sampled-token logprob across minor API variations."""
+    if not logprob_row:
+        return 0.0
+    item = None
+    if isinstance(logprob_row, dict):
+        item = logprob_row.get(token_id) or logprob_row.get(str(token_id))
+        if item is None and len(logprob_row) == 1:
+            item = next(iter(logprob_row.values()))
+    if item is None:
+        return 0.0
+    return float(getattr(item, "logprob", item))
+
+
+def _free_vllm(llm) -> None:
+    """Release vLLM distributed state and CUDA memory across vLLM versions."""
+    import gc
+
+    try:
+        from vllm.distributed.parallel_state import destroy_model_parallel
+
+        destroy_model_parallel()
+    except Exception:
+        pass
+    try:
+        from vllm.distributed.parallel_state import destroy_distributed_environment
+
+        destroy_distributed_environment()
+    except Exception:
+        pass
+    try:
+        del llm
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _generate_rollouts() -> None:
+    import csv
+    import gc
+    import json
+
+    category_map: dict[str, str] = {}
+    category_candidates = [
+        os.environ.get("GSPO_PROBLEMS_JSONL", "problems.jsonl"),
+        "nemotron-master/problems.jsonl",
+        "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/problems.jsonl",
+    ]
+    for path in category_candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                category_map[str(rec["id"])] = str(rec["category"])
+        if category_map:
+            print(f"EXP27: loaded {len(category_map)} categories from {path}")
+            break
+
+    rows: list[dict[str, str]] = []
+    with open(GSPO_ROLLOUT_TRAIN_CSV, newline="") as f:
+        for row in csv.DictReader(f):
+            row_id = str(row.get("id") or row.get("problem_id") or "")
+            if not row_id:
+                continue
+            category = row.get("category", "") or category_map.get(row_id, "")
+            row["id"] = row_id
+            row["category"] = category
+            if GSPO_ONLY_CATEGORY and category != GSPO_ONLY_CATEGORY:
+                continue
+            rows.append(row)
+    if GSPO_MAX_PROBLEMS:
+        rows = rows[:GSPO_MAX_PROBLEMS]
+    print(f"EXP27: generating rollouts for {len(rows)} problems, G={GSPO_GROUP_SIZE}")
+
+    if IS_KAGGLE:
+        import kagglehub
+
+        model_path = os.environ.get("GSPO_MODEL_PATH")
+        if not model_path:
+            model_path = kagglehub.model_download(
+                "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
+            )
+        adapter_src = os.environ.get("GSPO_ADAPTER", "/kaggle/tmp/pretrained_adapter")
+    else:
+        model_path = os.environ.get(
+            "GSPO_MODEL_PATH", "unsloth/Nemotron-3-Nano-30B-A3B"
+        )
+        adapter_src = os.environ.get("GSPO_ADAPTER", "/merged/weights")
+
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    llm = None
+    try:
+        llm = LLM(
+            model=model_path,
+            enable_lora=True,
+            max_lora_rank=32,
+            max_model_len=8192,
+            trust_remote_code=True,
+            dtype="bfloat16",
+        )
+        lora_request = None
+        if os.path.isfile(os.path.join(adapter_src, "adapter_config.json")):
+            try:
+                from vllm.lora.request import LoRARequest
+
+                lora_request = LoRARequest("gspo_adapter", 1, adapter_src)
+                print(f"EXP27: sampling with LoRA adapter at {adapter_src}")
+            except Exception as exc:
+                print(f"EXP27: could not attach LoRA adapter ({exc}); sampling base model")
+        else:
+            print(f"EXP27: adapter not found at {adapter_src}; sampling base model")
+
+        sampling_params = SamplingParams(
+            n=GSPO_GROUP_SIZE,
+            temperature=GSPO_TEMPERATURE,
+            top_p=GSPO_TOP_P,
+            max_tokens=int(os.environ.get("GSPO_MAX_TOKENS", "7680")),
+            logprobs=1,
+        )
+        prompt_token_ids = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": row["prompt"] + PROMPT_SUFFIX}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for row in rows
+        ]
+
+        outputs = llm.generate(
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+        )
+
+        out_dir = os.path.dirname(GSPO_ROLLOUTS)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        n_written = 0
+        n_groups_kept = 0
+        with open(GSPO_ROLLOUTS, "w") as fout:
+            for row, output in zip(rows, outputs):
+                prompt_ids = list(output.prompt_token_ids)
+                records: list[dict[str, object]] = []
+                rewards: list[float] = []
+                for completion in output.outputs:
+                    completion_ids = list(completion.token_ids)
+                    text = completion.text
+                    pred = extract_answer(text)
+                    reward = (
+                        1.0
+                        if format_ok(text) and compare_answer(row["answer"], pred)
+                        else 0.0
+                    )
+                    old_logp = [0.0] * len(prompt_ids)
+                    completion_logprobs = completion.logprobs or []
+                    for j, token_id in enumerate(completion_ids):
+                        logprob_row = (
+                            completion_logprobs[j]
+                            if j < len(completion_logprobs)
+                            else None
+                        )
+                        old_logp.append(_sampled_token_logprob(logprob_row, token_id))
+                    tokens = prompt_ids + completion_ids
+                    mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
+                    records.append(
+                        {
+                            "problem_id": row["id"],
+                            "category": row.get("category", "rollout"),
+                            "tokens": tokens,
+                            "mask": mask,
+                            "old_logp": old_logp,
+                            "reward": reward,
+                        }
+                    )
+                    rewards.append(reward)
+
+                if len(set(rewards)) < 2:
+                    continue
+                n_groups_kept += 1
+                for record in records:
+                    fout.write(json.dumps(record) + "\n")
+                    n_written += 1
+
+        print(
+            f"EXP27: wrote {n_written} rollouts "
+            f"({n_groups_kept} mixed-reward groups) -> {GSPO_ROLLOUTS}"
+        )
+    finally:
+        if llm is not None:
+            _free_vllm(llm)
+        gc.collect()
+
+
+# <<< EXP27 END
 
 IS_KAGGLE = "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 IS_MODAL_WORKER = "MODAL_TASK_ID" in os.environ
@@ -95,12 +375,7 @@ def run_training() -> None:
     import sys
     import time
 
-    from unsloth import FastLanguageModel
-
     import torch
-    from cut_cross_entropy import linear_cross_entropy
-    from peft import LoraConfig
-    from peft.tuners.lora import Linear as LoraLinear
 
     # ── Env-specific paths + adapter source ──────────────────────────
     if IS_KAGGLE:
@@ -199,17 +474,12 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +493,12 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -249,6 +514,70 @@ def run_training() -> None:
             f"using {len(original_ids)} ids from {TRAIN_CSV_PATH}"
         )
 
+    # >>> EXP27 START
+    if GSPO_ENABLE:
+        if not os.path.exists(GSPO_ROLLOUTS):
+            print(f"EXP27: rollouts chưa có -> sinh mới vào {GSPO_ROLLOUTS}")
+            _generate_rollouts()
+        else:
+            print(f"EXP27: tái dùng rollouts sẵn có tại {GSPO_ROLLOUTS}")
+
+        rollout_records: list[dict] = []
+        with open(GSPO_ROLLOUTS) as f:
+            for line in f:
+                if line.strip():
+                    rollout_records.append(json.loads(line))
+
+        rewards_by_problem: dict[str, list[float]] = {}
+        for rec in rollout_records:
+            rewards_by_problem.setdefault(str(rec["problem_id"]), []).append(
+                float(rec["reward"])
+            )
+
+        gspo_examples: list[dict] = []
+        for rec in rollout_records:
+            rewards = rewards_by_problem[str(rec["problem_id"])]
+            if len(rewards) < 2 or all(r == rewards[0] for r in rewards):
+                continue
+            mean_r = sum(rewards) / len(rewards)
+            var_r = sum((r - mean_r) ** 2 for r in rewards) / len(rewards)
+            advantage = (float(rec["reward"]) - mean_r) / (var_r**0.5 + 1e-4)
+
+            tokens = rec["tokens"]
+            mask = rec["mask"]
+            old_logp = rec["old_logp"]
+            if len(tokens) > MAX_SEQ_LEN:
+                tokens = tokens[:MAX_SEQ_LEN]
+                mask = mask[:MAX_SEQ_LEN]
+                old_logp = old_logp[:MAX_SEQ_LEN]
+            if len(old_logp) == len(tokens):
+                old_logp = old_logp[1:]
+            else:
+                old_logp = old_logp[: max(0, len(tokens) - 1)]
+            if not any(mask):
+                continue
+            gspo_examples.append(
+                {
+                    "problem_id": rec["problem_id"],
+                    "category": rec.get("category", "rollout"),
+                    "tokens": tokens[:-1],
+                    "targets": tokens[1:],
+                    "weights": [float(m) for m in mask[1:]],
+                    "old_logp": [float(v) for v in old_logp],
+                    "advantage": float(advantage),
+                }
+            )
+        if not gspo_examples:
+            raise RuntimeError(
+                "GSPO rollout file had no usable mixed-reward groups after filtering"
+            )
+        print(
+            f"EXP27 GSPO loaded {len(gspo_examples)} rollout examples "
+            f"from {GSPO_ROLLOUTS} (group target G={GSPO_GROUP_SIZE})"
+        )
+        examples = gspo_examples
+    # <<< EXP27 END
+
     total_unmasked = sum(sum(e["weights"]) for e in examples)
     total_tokens = sum(len(e["tokens"]) for e in examples)
     print(
@@ -257,6 +586,15 @@ def run_training() -> None:
     )
 
     # ── Load base model ──────────────────────────────────────────────
+    # >>> EXP27 START
+    from unsloth import FastLanguageModel
+
+    from cut_cross_entropy import linear_cross_entropy
+    from peft import LoraConfig
+    from peft.tuners.lora import Linear as LoraLinear
+
+    # <<< EXP27 END
+
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -561,6 +899,10 @@ def run_training() -> None:
         batch_tokens = [e["tokens"] for e in batch]
         batch_targets = [e["targets"] for e in batch]
         batch_weights = [e["weights"] for e in batch]
+        # >>> EXP27 START
+        batch_old_logp = [e.get("old_logp") for e in batch]
+        batch_advantages = [float(e.get("advantage", 0.0)) for e in batch]
+        # <<< EXP27 END
 
         n = len(batch)
         n_accum = math.ceil(n / MICRO_BATCH_SIZE)
@@ -572,6 +914,10 @@ def run_training() -> None:
             mb_toks = batch_tokens[mb_start:mb_end]
             mb_tgts = batch_targets[mb_start:mb_end]
             mb_wts = batch_weights[mb_start:mb_end]
+            # >>> EXP27 START
+            mb_old_logp = batch_old_logp[mb_start:mb_end]
+            mb_advantages = batch_advantages[mb_start:mb_end]
+            # <<< EXP27 END
 
             n_micro = len(mb_toks)
             max_len = max(len(t) for t in mb_toks)
@@ -586,6 +932,14 @@ def run_training() -> None:
             padded_weights = torch.zeros(
                 n_micro, max_len, dtype=torch.float32, device=device
             )
+            # >>> EXP27 START
+            padded_old_logp = torch.zeros(
+                n_micro, max_len, dtype=torch.float32, device=device
+            )
+            padded_adv = torch.zeros(
+                n_micro, max_len, dtype=torch.float32, device=device
+            )
+            # <<< EXP27 END
             attention_mask = torch.zeros(
                 n_micro, max_len, dtype=torch.long, device=device
             )
@@ -596,6 +950,14 @@ def run_training() -> None:
                 padded_weights[i, :seq_len] = torch.tensor(
                     mb_wts[i], dtype=torch.float32
                 )
+                # >>> EXP27 START
+                if mb_old_logp[i] is not None:
+                    old_len = min(seq_len, len(mb_old_logp[i]))
+                    padded_old_logp[i, :old_len] = torch.tensor(
+                        mb_old_logp[i][:old_len], dtype=torch.float32
+                    )
+                    padded_adv[i, :seq_len] = float(mb_advantages[i])
+                # <<< EXP27 END
                 attention_mask[i, :seq_len] = 1
 
             t0 = time.time()
@@ -607,14 +969,36 @@ def run_training() -> None:
                     use_cache=False,
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
-                weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
-                loss_sum_t = weighted_loss.sum()
-                loss = (
-                    loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
-                )
+                # >>> EXP27 START
+                if GSPO_ENABLE:
+                    mask = padded_weights
+                    cur_logp = -per_token_ce
+                    log_ratio = cur_logp - padded_old_logp
+                    seq_logw = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(
+                        min=1.0
+                    )
+                    seq_logw = torch.clamp(seq_logw, -20.0, 20.0).unsqueeze(-1)
+                    coef_1 = torch.exp(seq_logw)
+                    coef_2 = torch.clamp(
+                        coef_1, 1.0 - GSPO_EPS_LOW, 1.0 + GSPO_EPS_HIGH
+                    )
+                    per_tok = -torch.min(coef_1 * padded_adv, coef_2 * padded_adv)
+                    loss = (
+                        (per_tok * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+                    ).mean()
+                    weighted_loss = per_tok * mask
+                    weight_sum_t = mask.sum()
+                    loss_sum_t = weighted_loss.sum()
+                else:
+                    weighted_loss = per_token_ce * padded_weights
+                    weight_sum_t = padded_weights.sum()
+                    loss_sum_t = weighted_loss.sum()
+                    loss = (
+                        loss_sum_t / weight_sum_t
+                        if weight_sum_t > 0
+                        else loss_sum_t * 0.0
+                    )
+                # <<< EXP27 END
 
             (loss / n_accum).backward()
             total_loss_sum += loss_sum_t.item()

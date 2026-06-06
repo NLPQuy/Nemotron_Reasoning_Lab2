@@ -13,3 +13,5 @@ nemotron-master/raw/
 nemotron-master/reasoning/
 nemotron-master/training/
 .claude/
+# Batch-3 reference repos (cloned for codex reference; not tracked)
+refs/

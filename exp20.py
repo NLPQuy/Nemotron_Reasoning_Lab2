@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP20 — high-entropy forking-token loss weighting  (Batch-3 Idea 1)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/trl/trl/trainer/grpo_config.py top_entropy_quantile | Knob: ENTROPY_WEIGHTING=True | Rollback: set ENTROPY_WEIGHTING=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,13 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP20 START
+ENTROPY_WEIGHTING = True
+ENTROPY_TOP_QUANTILE = 0.2
+ENTROPY_HIGH_W = 2.0
+ENTROPY_LOW_W = 1.0
+# <<< EXP20 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -192,50 +204,60 @@ def run_training() -> None:
                 rec = json.load(f)
             tokens = rec["tokens"]
             mask = rec["mask"]
+            # >>> EXP20 START
+            entropy = rec.get("entropy")
+            # <<< EXP20 END
             if not tokens:
                 continue
             if len(tokens) > MAX_SEQ_LEN:
                 tokens = tokens[:MAX_SEQ_LEN]
                 mask = mask[:MAX_SEQ_LEN]
+                # >>> EXP20 START
+                if entropy is not None:
+                    entropy = entropy[:MAX_SEQ_LEN]
+                # <<< EXP20 END
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
-            examples.append(
-                {
-                    "problem_id": sid,
-                    "tokens": tokens[:-1],
-                    "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
-                }
-            )
+            # >>> EXP20 START
+            example = {
+                "problem_id": sid,
+                "tokens": tokens[:-1],
+                "targets": tokens[1:],
+                "weights": [float(m) for m in mask[1:]],
+            }
+            if entropy is not None:
+                example["entropy"] = [float(v) for v in entropy[1:]]
+            examples.append(example)
+            # <<< EXP20 END
     else:  # IS_MODAL_WORKER
         with open(CORPUS_PATH) as f:
             for line in f:
                 rec = json.loads(line.strip())
                 tokens = rec["tokens"]
                 mask = rec["mask"]
+                # >>> EXP20 START
+                entropy = rec.get("entropy")
+                # <<< EXP20 END
                 if len(tokens) > MAX_SEQ_LEN:
                     tokens = tokens[:MAX_SEQ_LEN]
                     mask = mask[:MAX_SEQ_LEN]
+                    # >>> EXP20 START
+                    if entropy is not None:
+                        entropy = entropy[:MAX_SEQ_LEN]
+                    # <<< EXP20 END
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
-                examples.append(
-                    {
-                        "problem_id": rec["problem_id"],
-                        "tokens": tokens[:-1],
-                        "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
-                    }
-                )
+                # >>> EXP20 START
+                example = {
+                    "problem_id": rec["problem_id"],
+                    "tokens": tokens[:-1],
+                    "targets": tokens[1:],
+                    "weights": [float(m) for m in mask[1:]],
+                }
+                if entropy is not None:
+                    example["entropy"] = [float(v) for v in entropy[1:]]
+                examples.append(example)
+                # <<< EXP20 END
 
     if ORIGINAL_PROBLEMS_ONLY:
         import csv
@@ -561,6 +583,9 @@ def run_training() -> None:
         batch_tokens = [e["tokens"] for e in batch]
         batch_targets = [e["targets"] for e in batch]
         batch_weights = [e["weights"] for e in batch]
+        # >>> EXP20 START
+        batch_entropy = [e.get("entropy") for e in batch]
+        # <<< EXP20 END
 
         n = len(batch)
         n_accum = math.ceil(n / MICRO_BATCH_SIZE)
@@ -572,6 +597,9 @@ def run_training() -> None:
             mb_toks = batch_tokens[mb_start:mb_end]
             mb_tgts = batch_targets[mb_start:mb_end]
             mb_wts = batch_weights[mb_start:mb_end]
+            # >>> EXP20 START
+            mb_entropy = batch_entropy[mb_start:mb_end]
+            # <<< EXP20 END
 
             n_micro = len(mb_toks)
             max_len = max(len(t) for t in mb_toks)
@@ -586,6 +614,12 @@ def run_training() -> None:
             padded_weights = torch.zeros(
                 n_micro, max_len, dtype=torch.float32, device=device
             )
+            # >>> EXP20 START
+            padded_entropy = torch.zeros(
+                n_micro, max_len, dtype=torch.float32, device=device
+            )
+            has_precomputed_entropy = any(v is not None for v in mb_entropy)
+            # <<< EXP20 END
             attention_mask = torch.zeros(
                 n_micro, max_len, dtype=torch.long, device=device
             )
@@ -596,6 +630,12 @@ def run_training() -> None:
                 padded_weights[i, :seq_len] = torch.tensor(
                     mb_wts[i], dtype=torch.float32
                 )
+                # >>> EXP20 START
+                if mb_entropy[i] is not None:
+                    padded_entropy[i, :seq_len] = torch.tensor(
+                        mb_entropy[i], dtype=torch.float32
+                    )
+                # <<< EXP20 END
                 attention_mask[i, :seq_len] = 1
 
             t0 = time.time()
@@ -607,10 +647,27 @@ def run_training() -> None:
                     use_cache=False,
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
+                # >>> EXP20 START
+                if ENTROPY_WEIGHTING:
+                    ent = (
+                        padded_entropy
+                        if has_precomputed_entropy
+                        else per_token_ce.detach().float()
+                    )
+                    valid = padded_weights > 0
+                    if valid.any():
+                        thr = torch.quantile(
+                            ent[valid], 1.0 - ENTROPY_TOP_QUANTILE
+                        )
+                        ent_factor = torch.where(
+                            ent >= thr,
+                            torch.full_like(ent, ENTROPY_HIGH_W),
+                            torch.full_like(ent, ENTROPY_LOW_W),
+                        )
+                        padded_weights = padded_weights * ent_factor
+                # <<< EXP20 END
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
                 loss = (
                     loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0

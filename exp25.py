@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP25 — GroupDRO worst-category objective  (Batch-3 Idea 6)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/group_DRO/loss.py | Knob: GROUP_DRO=True | Rollback: set GROUP_DRO=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,13 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP25 START
+GROUP_DRO = True
+DRO_STEP_SIZE = 0.01
+DRO_ADJ = 0.0
+REQUIRE_CATEGORY_MAP = True
+# <<< EXP25 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -159,6 +171,43 @@ def run_training() -> None:
         if os.path.exists(hf_modules):
             _shutil.rmtree(hf_modules)
 
+    # >>> EXP25 START
+    def _load_problem_categories() -> dict[str, str]:
+        candidates: list[str] = []
+        if IS_MODAL_WORKER:
+            candidates.extend(["/data/corpus.jsonl", "/data/problems.jsonl"])
+        if "nemotron-master" in CORPUS_PATH:
+            root = CORPUS_PATH.split("nemotron-master", 1)[0] + "nemotron-master"
+            candidates.extend(
+                [
+                    os.path.join(root, "corpus.jsonl"),
+                    os.path.join(root, "problems.jsonl"),
+                ]
+            )
+        candidates.extend(["nemotron-master/corpus.jsonl", "nemotron-master/problems.jsonl"])
+
+        out: dict[str, str] = {}
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    pid = rec.get("problem_id") or rec.get("id")
+                    cat = rec.get("category")
+                    if pid and cat:
+                        out[str(pid)] = str(cat)
+            if out:
+                print(f"EXP25 loaded {len(out)} problem categories from {path}")
+                return out
+        print("EXP25 warning: no category map found; using category='unknown'")
+        return out
+
+    problem_categories = _load_problem_categories()
+    # <<< EXP25 END
+
     # ── Load corpus into `examples` list ─────────────────────────────
     examples: list[dict] = []
 
@@ -199,17 +248,15 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
+                    # >>> EXP25 START
+                    "category": problem_categories.get(sid, "unknown"),
+                    # <<< EXP25 END
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +270,18 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
+                        # >>> EXP25 START
+                        "category": rec.get(
+                            "category",
+                            problem_categories.get(rec["problem_id"], "unknown"),
+                        ),
+                        # <<< EXP25 END
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -523,6 +571,26 @@ def run_training() -> None:
 
     device = next(model.parameters()).device
     optimizer: torch.optim.AdamW | None = None
+    # >>> EXP25 START
+    category_to_group = {
+        cat: i for i, cat in enumerate(sorted({str(e["category"]) for e in examples}))
+    }
+    if len(category_to_group) <= 1:
+        msg = (
+            f"EXP25: only saw {len(category_to_group)} category (empty map?) -> "
+            "GroupDRO will be a no-op. Check category source "
+            "(corpus.jsonl/problems.jsonl) in the runtime."
+        )
+        if REQUIRE_CATEGORY_MAP:
+            raise RuntimeError(msg)
+        print("WARNING: " + msg)
+    for e in examples:
+        e["group_id"] = category_to_group[str(e["category"])]
+    dro_q = torch.ones(len(category_to_group), dtype=torch.float32, device=device)
+    dro_q = dro_q / dro_q.sum().clamp(min=1.0)
+    if GROUP_DRO:
+        print(f"EXP25 GroupDRO groups: {category_to_group}")
+    # <<< EXP25 END
 
     indices = list(range(len(examples)))
     if SHUFFLE_DATASET:
@@ -561,6 +629,9 @@ def run_training() -> None:
         batch_tokens = [e["tokens"] for e in batch]
         batch_targets = [e["targets"] for e in batch]
         batch_weights = [e["weights"] for e in batch]
+        # >>> EXP25 START
+        batch_groups = [int(e["group_id"]) for e in batch]
+        # <<< EXP25 END
 
         n = len(batch)
         n_accum = math.ceil(n / MICRO_BATCH_SIZE)
@@ -572,6 +643,11 @@ def run_training() -> None:
             mb_toks = batch_tokens[mb_start:mb_end]
             mb_tgts = batch_targets[mb_start:mb_end]
             mb_wts = batch_weights[mb_start:mb_end]
+            # >>> EXP25 START
+            mb_groups = torch.tensor(
+                batch_groups[mb_start:mb_end], dtype=torch.long, device=device
+            )
+            # <<< EXP25 END
 
             n_micro = len(mb_toks)
             max_len = max(len(t) for t in mb_toks)
@@ -608,13 +684,37 @@ def run_training() -> None:
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
-                loss = (
-                    loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
-                )
+                # >>> EXP25 START
+                if GROUP_DRO and weight_sum_t > 0:
+                    seq_loss_sum = weighted_loss.sum(dim=1)
+                    seq_weight_sum = padded_weights.sum(dim=1)
+                    group_loss = torch.zeros_like(dro_q)
+                    present = torch.zeros_like(dro_q, dtype=torch.bool)
+                    for gid in mb_groups.unique(sorted=True):
+                        members = mb_groups == gid
+                        denom = seq_weight_sum[members].sum()
+                        if denom <= 0:
+                            continue
+                        group_loss[gid] = seq_loss_sum[members].sum() / denom
+                        present[gid] = True
+                    if present.any():
+                        with torch.no_grad():
+                            dro_q[present] = dro_q[present] * torch.exp(
+                                DRO_STEP_SIZE * (group_loss[present].detach() - DRO_ADJ)
+                            )
+                            dro_q.copy_(dro_q / dro_q.sum().clamp(min=1e-12))
+                        loss = (dro_q[present] * group_loss[present]).sum()
+                    else:
+                        loss = loss_sum_t * 0.0
+                else:
+                    loss = (
+                        loss_sum_t / weight_sum_t
+                        if weight_sum_t > 0
+                        else loss_sum_t * 0.0
+                    )
+                # <<< EXP25 END
 
             (loss / n_accum).backward()
             total_loss_sum += loss_sum_t.item()

@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP21 — LoRA+ split learning rates for A/B matrices  (Batch-3 Idea 2)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/loraplus/lora_plus.py | Knob: LORAPLUS_LR_RATIO=8.0 | Rollback: set LORAPLUS_LR_RATIO=1.0
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,10 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP21 START
+LORAPLUS_LR_RATIO = 8.0
+# <<< EXP21 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -199,17 +208,12 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +227,12 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -608,9 +607,7 @@ def run_training() -> None:
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
                 loss = (
                     loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
@@ -631,17 +628,48 @@ def run_training() -> None:
                 f"peak={peak_gb:.1f}GB, mem={mem_gb:.1f}GB"
             )
 
+        # >>> EXP21 START
         if optimizer is None:
-            optimizer = torch.optim.AdamW(
-                [p for p in model.parameters() if p.requires_grad],
-                lr=LEARNING_RATE,
-                betas=(0.9, 0.95),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
+            if LORAPLUS_LR_RATIO != 1.0:
+                group_b: list[torch.Tensor] = []
+                group_a_other: list[torch.Tensor] = []
+                for name, param in model.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    if ".lora_B." in name:
+                        group_b.append(param)
+                    else:
+                        group_a_other.append(param)
+                optimizer = torch.optim.AdamW(
+                    [
+                        {"params": group_a_other, "lr": LEARNING_RATE},
+                        {
+                            "params": group_b,
+                            "lr": LEARNING_RATE * LORAPLUS_LR_RATIO,
+                        },
+                    ],
+                    betas=(0.9, 0.95),
+                    eps=1e-8,
+                    weight_decay=0.0,
+                )
+                print(
+                    "EXP21 LoRA+: "
+                    f"{sum(p.numel() for p in group_b):,} lora_B params at "
+                    f"{LORAPLUS_LR_RATIO:g}x lr"
+                )
+            else:
+                optimizer = torch.optim.AdamW(
+                    [p for p in model.parameters() if p.requires_grad],
+                    lr=LEARNING_RATE,
+                    betas=(0.9, 0.95),
+                    eps=1e-8,
+                    weight_decay=0.0,
+                )
         lr = LEARNING_RATE * (1 - step / num_steps)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        optimizer.param_groups[0]["lr"] = lr
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[1]["lr"] = lr * LORAPLUS_LR_RATIO
+        # <<< EXP21 END
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
         grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], max_norm=1e9

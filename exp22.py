@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP22 — DoReMi-style category data-mixture reweighting  (Batch-3 Idea 3)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/doremi/doremi/trainer.py + dataloader.py | Knob: DOREMI_REWEIGHT=True | Rollback: set DOREMI_REWEIGHT=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,17 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP22 START
+DOREMI_REWEIGHT = True
+DOREMI_SMOOTHING_C = 0.1
+DOREMI_WEIGHT_FLOOR = 0.5
+DOREMI_WEIGHT_CEIL = 2.0
+# Optional explicit relative weights, e.g. {"cryptarithm_guess": 2.0}.
+# Empty dict uses an inverse-unmasked-token-share proxy.
+DOREMI_CATEGORY_WEIGHTS: dict[str, float] = {}
+REQUIRE_CATEGORY_MAP = True
+# <<< EXP22 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -127,6 +143,103 @@ def run_training() -> None:
         ADAPTER_SRC = "/merged/weights"
         OUTPUT_DIR = "/output/weights"
 
+    # >>> EXP22 START
+    def _load_problem_categories() -> dict[str, str]:
+        candidates: list[str] = []
+        if IS_MODAL_WORKER:
+            candidates.extend(["/data/corpus.jsonl", "/data/problems.jsonl"])
+        if "nemotron-master" in CORPUS_PATH:
+            root = CORPUS_PATH.split("nemotron-master", 1)[0] + "nemotron-master"
+            candidates.extend(
+                [
+                    os.path.join(root, "corpus.jsonl"),
+                    os.path.join(root, "problems.jsonl"),
+                ]
+            )
+        candidates.extend(["nemotron-master/corpus.jsonl", "nemotron-master/problems.jsonl"])
+
+        out: dict[str, str] = {}
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    pid = rec.get("problem_id") or rec.get("id")
+                    cat = rec.get("category")
+                    if pid and cat:
+                        out[str(pid)] = str(cat)
+            if out:
+                print(f"EXP22 loaded {len(out)} problem categories from {path}")
+                return out
+        print("EXP22 warning: no category map found; using category='unknown'")
+        return out
+
+    def _stable_unit_interval(key: str) -> float:
+        import hashlib
+
+        raw = hashlib.sha256(key.encode()).digest()
+        return int.from_bytes(raw[:8], "big") / float(2**64)
+
+    def _bounded_category_weights(exs: list[dict]) -> dict[str, float]:
+        if DOREMI_CATEGORY_WEIGHTS:
+            return {
+                str(cat): min(DOREMI_WEIGHT_CEIL, max(DOREMI_WEIGHT_FLOOR, float(w)))
+                for cat, w in DOREMI_CATEGORY_WEIGHTS.items()
+            }
+        token_mass: dict[str, float] = {}
+        for ex in exs:
+            cat = str(ex.get("category", "unknown"))
+            token_mass[cat] = token_mass.get(cat, 0.0) + float(sum(ex["weights"]))
+        if len(token_mass) <= 1:
+            return {cat: 1.0 for cat in token_mass}
+        total = sum(token_mass.values())
+        n = len(token_mass)
+        raw = {
+            cat: (1.0 / n) / max(mass / total, 1e-12)
+            for cat, mass in token_mass.items()
+        }
+        raw_total = sum(raw.values())
+        smoothed = {
+            cat: (1.0 - DOREMI_SMOOTHING_C) * (raw[cat] / raw_total)
+            + DOREMI_SMOOTHING_C * (1.0 / n)
+            for cat in raw
+        }
+        uniform = 1.0 / n
+        return {
+            cat: min(
+                DOREMI_WEIGHT_CEIL,
+                max(DOREMI_WEIGHT_FLOOR, smoothed[cat] / uniform),
+            )
+            for cat in smoothed
+        }
+
+    def _apply_doremi_resampling(exs: list[dict]) -> list[dict]:
+        if not DOREMI_REWEIGHT:
+            return exs
+        weights = _bounded_category_weights(exs)
+        out: list[dict] = []
+        for idx, ex in enumerate(exs):
+            cat = str(ex.get("category", "unknown"))
+            weight = max(0.0, weights.get(cat, 1.0))
+            copies = int(weight)
+            frac = weight - copies
+            if _stable_unit_interval(f"{ex['problem_id']}:{idx}:{cat}") < frac:
+                copies += 1
+            for copy_idx in range(copies):
+                dup = dict(ex)
+                if copy_idx:
+                    dup["problem_id"] = f"{ex['problem_id']}__doremi{copy_idx}"
+                out.append(dup)
+        print(f"EXP22 DoReMi weights: {weights}")
+        print(f"EXP22 resampled examples: {len(exs)} -> {len(out)}")
+        return out
+
+    problem_categories = _load_problem_categories()
+    # <<< EXP22 END
+
     # ── GPU + kernel sanity check (runs on both Kaggle and Modal worker) ──
     import causal_conv1d
     import mamba_ssm
@@ -199,17 +312,15 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
+                    # >>> EXP22 START
+                    "category": problem_categories.get(sid, "unknown"),
+                    # <<< EXP22 END
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +334,18 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
+                        # >>> EXP22 START
+                        "category": rec.get(
+                            "category",
+                            problem_categories.get(rec["problem_id"], "unknown"),
+                        ),
+                        # <<< EXP22 END
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -248,6 +360,20 @@ def run_training() -> None:
             f"ORIGINAL_PROBLEMS_ONLY=True: filtered {before} → {len(examples)} examples "
             f"using {len(original_ids)} ids from {TRAIN_CSV_PATH}"
         )
+
+    # >>> EXP22 START
+    _n_cats = len({str(e.get("category", "unknown")) for e in examples})
+    if _n_cats <= 1:
+        msg = (
+            f"EXP22: only saw {_n_cats} category (empty map?) -> "
+            "DoReMi will be a no-op. Check category source "
+            "(corpus.jsonl/problems.jsonl) in the runtime."
+        )
+        if REQUIRE_CATEGORY_MAP:
+            raise RuntimeError(msg)
+        print("WARNING: " + msg)
+    examples = _apply_doremi_resampling(examples)
+    # <<< EXP22 END
 
     total_unmasked = sum(sum(e["weights"]) for e in examples)
     total_tokens = sum(len(e["tokens"]) for e in examples)
@@ -608,9 +734,7 @@ def run_training() -> None:
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
                 loss = (
                     loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0

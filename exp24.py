@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP24 — self-contained CSP traces for guess tasks  (Batch-3 Idea 5)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/python-constraint BacktrackingSolver + wordmath examples | Knob: CSP_GUESS_ENABLE=True | Rollback: set CSP_GUESS_ENABLE=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,11 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP24 START
+CSP_GUESS_ENABLE = True
+CSP_GUESS_MAX_EXAMPLES = 400
+# <<< EXP24 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -127,6 +137,284 @@ def run_training() -> None:
         ADAPTER_SRC = "/merged/weights"
         OUTPUT_DIR = "/output/weights"
 
+    # >>> EXP24 START
+    def _load_problem_categories() -> dict[str, str]:
+        candidates: list[str] = []
+        if IS_MODAL_WORKER:
+            candidates.extend(["/data/corpus.jsonl", "/data/problems.jsonl"])
+        if "nemotron-master" in CORPUS_PATH:
+            root = CORPUS_PATH.split("nemotron-master", 1)[0] + "nemotron-master"
+            candidates.extend(
+                [
+                    os.path.join(root, "corpus.jsonl"),
+                    os.path.join(root, "problems.jsonl"),
+                ]
+            )
+        candidates.extend(["nemotron-master/corpus.jsonl", "nemotron-master/problems.jsonl"])
+
+        out: dict[str, str] = {}
+        loaded_from: list[str] = []
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    pid = rec.get("problem_id") or rec.get("id")
+                    cat = rec.get("category")
+                    if pid and cat:
+                        out[str(pid)] = str(cat)
+            loaded_from.append(path)
+        if out:
+            print(
+                f"EXP24 loaded {len(out)} problem categories from "
+                f"{', '.join(loaded_from)}"
+            )
+            return out
+        print("EXP24 warning: no category map found; parsing guess-like prompts")
+        return out
+
+    def _parse_equation_prompt(prompt: str) -> tuple[list[tuple[str, str]], str] | None:
+        import re
+
+        if "Below are a few examples:" not in prompt:
+            return None
+        if "Now, determine the result for:" not in prompt:
+            return None
+        body = prompt.split("Below are a few examples:\n", 1)[1]
+        examples_text, question_text = body.split("\nNow, determine the result for:", 1)
+        examples: list[tuple[str, str]] = []
+        for raw_line in examples_text.splitlines():
+            line = raw_line.strip()
+            if not line or " = " not in line:
+                continue
+            left, right = line.split(" = ", 1)
+            examples.append((left.strip(), right.strip()))
+        question = question_text.strip().splitlines()[0].strip()
+        if not examples or not question:
+            return None
+        if not re.fullmatch(r".{2,}\S.{2,}", question):
+            return None
+        return examples, question
+
+    def _split_expr(expr: str) -> tuple[str, str, str] | None:
+        import re
+
+        m = re.fullmatch(r"(.+?)(\D)(.+)", expr)
+        if not m:
+            return None
+        return m.group(1), m.group(2), m.group(3)
+
+    def _numeric_candidates(a: str, b: str) -> list[tuple[str, str]]:
+        if not a.isdigit() or not b.isdigit():
+            return []
+        ai, bi = int(a), int(b)
+        out = [
+            ("addition", str(ai + bi)),
+            ("subtraction", str(ai - bi)),
+            ("reverse subtraction", str(bi - ai)),
+            ("absolute difference", str(abs(ai - bi))),
+            ("multiplication", str(ai * bi)),
+            ("concatenation", a + b),
+            ("reverse concatenation", b + a),
+        ]
+        if bi:
+            out.extend(
+                [
+                    ("integer division", str(ai // bi)),
+                    ("modulo", str(ai % bi)),
+                ]
+            )
+        if ai:
+            out.extend(
+                [
+                    ("reverse integer division", str(bi // ai)),
+                    ("reverse modulo", str(bi % ai)),
+                ]
+            )
+        if len(a) == 2 and len(b) == 2:
+            d1, d2, d3, d4 = int(a[0]), int(a[1]), int(b[0]), int(b[1])
+            out.extend(
+                [
+                    ("digit add mod10", f"{(d1 + d3) % 10}{(d2 + d4) % 10}"),
+                    ("digit sub mod10", f"{(d1 - d3) % 10}{(d2 - d4) % 10}"),
+                    ("cross multiply", str(d1 * d3 + d2 * d4)),
+                    ("cross multiply reverse", str(d1 * d4 + d2 * d3)),
+                    ("determinant", str(d1 * d4 - d2 * d3)),
+                    ("absolute determinant", str(abs(d1 * d4 - d2 * d3))),
+                ]
+            )
+        return out
+
+    def _symbol_candidates(left: str, right: str) -> list[tuple[str, str]]:
+        return [
+            ("left side", left),
+            ("right side", right),
+            ("concatenation", left + right),
+            ("reverse concatenation", right + left),
+            ("outer symbols", left[:1] + right[-1:]),
+            ("inner symbols", left[-1:] + right[:1]),
+            ("left reversed plus right", left[::-1] + right),
+            ("right reversed plus left", right[::-1] + left),
+        ]
+
+    def _find_consistent_rule(
+        examples: list[tuple[str, str]], question: str, answer: str
+    ) -> tuple[str, bool]:
+        parsed_examples = []
+        for inp, out in examples:
+            parsed = _split_expr(inp)
+            if parsed is None:
+                return "verified backtracking table", False
+            parsed_examples.append((*parsed, out))
+        q_parsed = _split_expr(question)
+        if q_parsed is None:
+            return "verified backtracking table", False
+        numeric = all(a.isdigit() and b.isdigit() for a, _, b, _ in parsed_examples)
+        q_a, _, q_b = q_parsed
+        q_candidates = _numeric_candidates(q_a, q_b) if numeric else _symbol_candidates(q_a, q_b)
+        for rule_name, q_value in q_candidates:
+            if q_value != answer:
+                continue
+            ok = True
+            for a, _, b, out in parsed_examples:
+                candidates = _numeric_candidates(a, b) if numeric else _symbol_candidates(a, b)
+                value = next((v for name, v in candidates if name == rule_name), None)
+                if value != out:
+                    ok = False
+                    break
+            if ok:
+                return rule_name, True
+        return "verified backtracking table", False
+
+    def _csp_trace(
+        pid: str,
+        category: str,
+        examples: list[tuple[str, str]],
+        question: str,
+        answer: str,
+    ) -> str:
+        rule_name, strict = _find_consistent_rule(examples, question, answer)
+        lines = [
+            "We need to infer the hidden equation rule from the examples.",
+            "I will solve it as a small constraint satisfaction problem.",
+            "",
+            "Variables:",
+            "  rule_family = the hidden transformation.",
+            "  operator_binding = which visible operator uses that rule.",
+            "  output = the value produced for the question.",
+            "",
+            "Constraints from the examples:",
+        ]
+        for inp, out in examples:
+            lines.append(f"  {inp} -> {out}")
+        lines.extend(
+            [
+                "",
+                "Backtracking search:",
+                "  assign rule_family candidates in a fixed deterministic order.",
+                "  reject a candidate as soon as it violates any example output.",
+                "  keep the first candidate that satisfies every example.",
+            ]
+        )
+        if strict:
+            lines.append(f"  The consistent candidate is {rule_name}.")
+        lines.extend(
+            [
+                "",
+                f"Applying the selected constraint solution to {question}:",
+                f"  output = {answer}",
+                "",
+                "I will now return the answer in \\boxed{}",
+                f"The answer in \\boxed{{-}} is \\boxed{{{answer}}}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _tokenize_csp_guess_examples(model_path: str, category_map: dict[str, str]) -> list[dict]:
+        import csv
+        import re
+
+        from transformers import AutoTokenizer
+
+        target_categories = {"cryptarithm_guess", "equation_numeric_guess"}
+        chat_tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        out: list[dict] = []
+        with open(TRAIN_CSV_PATH, newline="") as f:
+            n_skipped = 0
+            for row in csv.DictReader(f):
+                pid = row["id"]
+                parsed = _parse_equation_prompt(row["prompt"])
+                if parsed is None:
+                    continue
+                examples, question = parsed
+                inferred_category = (
+                    "equation_numeric_guess"
+                    if re.fullmatch(r"\d+\D\d+", question)
+                    else "cryptarithm_guess"
+                )
+                category = category_map.get(pid, inferred_category)
+                if category_map and category not in target_categories:
+                    continue
+                if category not in target_categories:
+                    continue
+                answer = row["answer"].strip()
+                # >>> EXP24 START  (no-fabrication gate)
+                rule_name, strict = _find_consistent_rule(
+                    examples, question, answer
+                )
+                if not strict:
+                    n_skipped += 1
+                    continue
+                # <<< EXP24 END
+                reasoning = _csp_trace(pid, category, examples, question, answer)
+                if f"\\boxed{{{answer}}}" not in reasoning:
+                    continue
+                prompt_suffix = (
+                    "\nPlease put your final answer inside `\\boxed{}`. "
+                    "For example: `\\boxed{your answer}`"
+                )
+                prompt_ids = chat_tokenizer.apply_chat_template(
+                    [{"role": "user", "content": row["prompt"] + prompt_suffix}],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=True,
+                )
+                completion_ids = chat_tokenizer.encode(
+                    f"{reasoning}\n</think>\n\\boxed{{{answer}}}<|im_end|>",
+                    add_special_tokens=False,
+                )
+                tokens = prompt_ids + completion_ids
+                mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
+                if len(tokens) > MAX_SEQ_LEN:
+                    tokens = tokens[:MAX_SEQ_LEN]
+                    mask = mask[:MAX_SEQ_LEN]
+                if not any(mask):
+                    continue
+                out.append(
+                    {
+                        "problem_id": f"{pid}__csp_guess",
+                        "category": category,
+                        "tokens": tokens[:-1],
+                        "targets": tokens[1:],
+                        "weights": [float(m) for m in mask[1:]],
+                    }
+                )
+                if len(out) >= CSP_GUESS_MAX_EXAMPLES:
+                    break
+        print(
+            f"EXP24 CSP solve-rate: {len(out)} solved / "
+            f"{len(out) + n_skipped} attempted (skipped {n_skipped} unsolved)"
+        )
+        return out
+
+    problem_categories = _load_problem_categories()
+    # <<< EXP24 END
+
     # ── GPU + kernel sanity check (runs on both Kaggle and Modal worker) ──
     import causal_conv1d
     import mamba_ssm
@@ -199,17 +487,12 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +506,12 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -248,6 +526,13 @@ def run_training() -> None:
             f"ORIGINAL_PROBLEMS_ONLY=True: filtered {before} → {len(examples)} examples "
             f"using {len(original_ids)} ids from {TRAIN_CSV_PATH}"
         )
+
+    # >>> EXP24 START
+    if CSP_GUESS_ENABLE:
+        csp_examples = _tokenize_csp_guess_examples(MODEL_PATH, problem_categories)
+        examples.extend(csp_examples)
+        print(f"EXP24 appended {len(csp_examples)} CSP guess examples")
+    # <<< EXP24 END
 
     total_unmasked = sum(sum(e["weights"]) for e in examples)
     total_tokens = sum(len(e["tokens"]) for e in examples)
@@ -608,9 +893,7 @@ def run_training() -> None:
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
                 loss = (
                     loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0

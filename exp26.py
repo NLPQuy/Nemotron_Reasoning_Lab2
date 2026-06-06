@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP26 — HER-style forward generation for guess tasks  (Batch-3 Idea 7)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/stable-baselines3/stable_baselines3/her | Knob: HER_ENABLE=True | Rollback: set HER_ENABLE=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,11 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP26 START
+HER_ENABLE = True
+HER_N_PER_CATEGORY = 500
+# <<< EXP26 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -127,6 +137,158 @@ def run_training() -> None:
         ADAPTER_SRC = "/merged/weights"
         OUTPUT_DIR = "/output/weights"
 
+    # >>> EXP26 START
+    def _her_pid(prefix: str, i: int) -> str:
+        import hashlib
+
+        return hashlib.sha256(f"{prefix}_{i}".encode()).hexdigest()[:8]
+
+    def _her_digits(rng: random.Random) -> str:
+        return f"{rng.randint(0, 99):02d}"
+
+    def _her_apply_numeric(rule: str, a: str, b: str) -> str:
+        ai, bi = int(a), int(b)
+        if rule == "add":
+            return str(ai + bi)
+        if rule == "sub":
+            return str(ai - bi)
+        if rule == "absdiff":
+            return str(abs(ai - bi))
+        if rule == "mul":
+            return str(ai * bi)
+        if rule == "revcat":
+            return b + a
+        return a + b
+
+    def _her_numeric_problem(rng: random.Random, idx: int) -> dict[str, str]:
+        ops = list("+-*/?!@#$%&")
+        rule = rng.choice(["add", "sub", "absdiff", "mul", "cat", "revcat"])
+        op = rng.choice(ops)
+        rows = []
+        for _ in range(4):
+            a, b = _her_digits(rng), _her_digits(rng)
+            rows.append((f"{a}{op}{b}", _her_apply_numeric(rule, a, b)))
+        qa, qb = _her_digits(rng), _her_digits(rng)
+        question = f"{qa}{op}{qb}"
+        answer = _her_apply_numeric(rule, qa, qb)
+        prompt = (
+            "In Alice's Wonderland, a secret set of transformation rules is applied "
+            "to equations. Below are a few examples:\n"
+            + "\n".join(f"{inp} = {out}" for inp, out in rows)
+            + f"\nNow, determine the result for: {question}"
+        )
+        completion = (
+            "We infer the operator rule from the examples.\n"
+            + "\n".join(
+                f"{inp} follows the {rule} rule and gives {out}."
+                for inp, out in rows
+            )
+            + f"\nApplying the same rule to {question} gives {answer}.\n"
+            + f"The answer in \\boxed{{-}} is \\boxed{{{answer}}}"
+        )
+        return {
+            "id": _her_pid("her_equation_numeric_guess", idx),
+            "category": "equation_numeric_guess",
+            "prompt": prompt,
+            "completion": completion,
+            "answer": answer,
+        }
+
+    def _her_apply_crypto(rule: str, left: str, right: str) -> str:
+        if rule == "left":
+            return left
+        if rule == "right":
+            return right
+        if rule == "swap":
+            return right + left
+        if rule == "outer":
+            return left[0] + right[-1]
+        return left + right
+
+    def _her_crypto_problem(rng: random.Random, idx: int) -> dict[str, str]:
+        symbols = list("!#$%&'()*+-./:;<>?@[]^`{|}")
+        ops = list("+-*/?!@#$%&")
+        rule = rng.choice(["concat", "swap", "left", "right", "outer"])
+        op = rng.choice(ops)
+        rows = []
+        for _ in range(4):
+            chars = rng.sample(symbols, 4)
+            left, right = "".join(chars[:2]), "".join(chars[2:])
+            rows.append((f"{left}{op}{right}", _her_apply_crypto(rule, left, right)))
+        qchars = rng.sample(symbols, 4)
+        qleft, qright = "".join(qchars[:2]), "".join(qchars[2:])
+        question = f"{qleft}{op}{qright}"
+        answer = _her_apply_crypto(rule, qleft, qright)
+        prompt = (
+            "In Alice's Wonderland, a secret set of transformation rules is applied "
+            "to equations. Below are a few examples:\n"
+            + "\n".join(f"{inp} = {out}" for inp, out in rows)
+            + f"\nNow, determine the result for: {question}"
+        )
+        completion = (
+            "We infer the symbol transformation from the examples.\n"
+            + "\n".join(
+                f"{inp} follows the {rule} rule and gives {out}."
+                for inp, out in rows
+            )
+            + f"\nApplying the same rule to {question} gives {answer}.\n"
+            + f"The answer in \\boxed{{-}} is \\boxed{{{answer}}}"
+        )
+        return {
+            "id": _her_pid("her_cryptarithm_guess", idx),
+            "category": "cryptarithm_guess",
+            "prompt": prompt,
+            "completion": completion,
+            "answer": answer,
+        }
+
+    def _tokenize_her_examples(model_path: str) -> list[dict]:
+        from transformers import AutoTokenizer
+
+        rng = random.Random(20260602)
+        raw: list[dict[str, str]] = []
+        for i in range(HER_N_PER_CATEGORY):
+            raw.append(_her_numeric_problem(rng, i))
+            raw.append(_her_crypto_problem(rng, i))
+
+        chat_tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        out: list[dict] = []
+        for rec in raw:
+            prompt_suffix = (
+                "\nPlease put your final answer inside `\\boxed{}`. "
+                "For example: `\\boxed{your answer}`"
+            )
+            prompt_ids = chat_tokenizer.apply_chat_template(
+                [{"role": "user", "content": rec["prompt"] + prompt_suffix}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            completion_ids = chat_tokenizer.encode(
+                f"{rec['completion']}\n</think>\n\\boxed{{{rec['answer']}}}<|im_end|>",
+                add_special_tokens=False,
+            )
+            tokens = prompt_ids + completion_ids
+            mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
+            if len(tokens) > MAX_SEQ_LEN:
+                tokens = tokens[:MAX_SEQ_LEN]
+                mask = mask[:MAX_SEQ_LEN]
+            if not any(mask):
+                continue
+            out.append(
+                {
+                    "problem_id": rec["id"],
+                    "category": rec["category"],
+                    "tokens": tokens[:-1],
+                    "targets": tokens[1:],
+                    "weights": [float(m) for m in mask[1:]],
+                }
+            )
+        return out
+    # <<< EXP26 END
+
     # ── GPU + kernel sanity check (runs on both Kaggle and Modal worker) ──
     import causal_conv1d
     import mamba_ssm
@@ -199,17 +361,12 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +380,12 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -248,6 +400,13 @@ def run_training() -> None:
             f"ORIGINAL_PROBLEMS_ONLY=True: filtered {before} → {len(examples)} examples "
             f"using {len(original_ids)} ids from {TRAIN_CSV_PATH}"
         )
+
+    # >>> EXP26 START
+    if HER_ENABLE:
+        her_examples = _tokenize_her_examples(MODEL_PATH)
+        examples.extend(her_examples)
+        print(f"EXP26 HER appended {len(her_examples)} synthetic guess examples")
+    # <<< EXP26 END
 
     total_unmasked = sum(sum(e["weights"]) for e in examples)
     total_tokens = sum(len(e["tokens"]) for e in examples)
@@ -608,9 +767,7 @@ def run_training() -> None:
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
                 loss = (
                     loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0

@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# ============================================================
+# EXP23 — ESFT hot-expert MoE LoRA specialization  (Batch-3 Idea 4)
+# Base: Continuer_Nemotron_Notebook.py (unmodified except marked blocks)
+# Ref: refs/ESFT/utils.py, refs/ESFT/esft.py | Knob: ESFT_SELECT=True | Rollback: set ESFT_SELECT=False
+# ============================================================
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -21,6 +26,13 @@ ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+
+# >>> EXP23 START
+ESFT_SELECT = True
+ESFT_TOP_EXPERTS = 16
+ESFT_PROFILE_BATCHES = 8
+ESFT_AFFINITY_PATH = "hot_experts.json"
+# <<< EXP23 END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -199,17 +211,12 @@ def run_training() -> None:
                 mask = mask[:MAX_SEQ_LEN]
             if not any(mask):
                 continue
-            # >>> EXP_WEIGHT_SIGN START
-            w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-            # >>> EXP_WEIGHT_SIGN END
             examples.append(
                 {
                     "problem_id": sid,
                     "tokens": tokens[:-1],
                     "targets": tokens[1:],
-                    # >>> EXP_WEIGHT_SIGN START
-                    "weights": [w * float(m) for m in mask[1:]],
-                    # >>> EXP_WEIGHT_SIGN END
+                    "weights": [float(m) for m in mask[1:]],
                 }
             )
     else:  # IS_MODAL_WORKER
@@ -223,17 +230,12 @@ def run_training() -> None:
                     mask = mask[:MAX_SEQ_LEN]
                 if not any(mask):
                     continue
-                # >>> EXP_WEIGHT_SIGN START
-                w = float(rec.get("weight", 1.0)) * float(rec.get("sign", 1.0))
-                # >>> EXP_WEIGHT_SIGN END
                 examples.append(
                     {
                         "problem_id": rec["problem_id"],
                         "tokens": tokens[:-1],
                         "targets": tokens[1:],
-                        # >>> EXP_WEIGHT_SIGN START
-                        "weights": [w * float(m) for m in mask[1:]],
-                        # >>> EXP_WEIGHT_SIGN END
+                        "weights": [float(m) for m in mask[1:]],
                     }
                 )
 
@@ -458,6 +460,119 @@ def run_training() -> None:
     frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     print(f"  {trainable_params:,} trainable / {frozen_params:,} frozen")
 
+    # >>> EXP23 START
+    HOT_EXPERTS: set[int] = set()
+
+    def _profile_hot_experts() -> set[int]:
+        if not ESFT_SELECT or ESFT_TOP_EXPERTS <= 0:
+            return set()
+        if os.path.isfile(ESFT_AFFINITY_PATH):
+            with open(ESFT_AFFINITY_PATH) as f:
+                payload = json.load(f)
+            hot = {int(v) for v in payload.get("hot_experts", [])}
+            print(f"EXP23 loaded {len(hot)} hot experts from {ESFT_AFFINITY_PATH}")
+            return hot
+
+        gate_scores: dict[str, torch.Tensor] = {}
+        hooks = []
+
+        def _make_hook(module_name: str):
+            def _hook(_module, _inputs, output) -> None:
+                tensors = []
+                if torch.is_tensor(output):
+                    tensors = [output]
+                elif isinstance(output, (tuple, list)):
+                    tensors = [x for x in output if torch.is_tensor(x)]
+                if not tensors:
+                    return
+                logits = max(tensors, key=lambda x: x.numel())
+                if logits.dim() < 2:
+                    return
+                scores = torch.softmax(logits.detach().float(), dim=-1)
+                reduce_dims = tuple(range(scores.dim() - 1))
+                layer_score = scores.sum(dim=reduce_dims).cpu()
+                prev = gate_scores.get(module_name)
+                gate_scores[module_name] = (
+                    layer_score if prev is None else prev + layer_score
+                )
+
+            return _hook
+
+        for module_name, module in model.named_modules():
+            if module_name.endswith("mixer.gate") or ".mixer.gate" in module_name:
+                hooks.append(module.register_forward_hook(_make_hook(module_name)))
+        print(f"EXP23 profiling {len(hooks)} mixer.gate modules")
+        if not hooks:
+            return set()
+
+        was_training = model.training
+        model.eval()
+        device = next(model.parameters()).device
+        try:
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                for profile_start in range(
+                    0, min(len(examples), ESFT_PROFILE_BATCHES * MICRO_BATCH_SIZE), MICRO_BATCH_SIZE
+                ):
+                    profile_batch = examples[
+                        profile_start : profile_start + MICRO_BATCH_SIZE
+                    ]
+                    if not profile_batch:
+                        break
+                    max_len = max(len(e["tokens"]) for e in profile_batch)
+                    padded_input = torch.zeros(
+                        len(profile_batch), max_len, dtype=torch.long, device=device
+                    )
+                    attention_mask = torch.zeros(
+                        len(profile_batch), max_len, dtype=torch.long, device=device
+                    )
+                    for i, example in enumerate(profile_batch):
+                        seq_len = len(example["tokens"])
+                        padded_input[i, :seq_len] = torch.tensor(
+                            example["tokens"], dtype=torch.long
+                        )
+                        attention_mask[i, :seq_len] = 1
+                    model(
+                        input_ids=padded_input,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
+        except Exception as _e:
+            print(f"EXP23 profiling failed ({_e}); falling back to tie-all")
+            return set()
+        finally:
+            for hook in hooks:
+                hook.remove()
+            if was_training:
+                model.train()
+
+        if not gate_scores:
+            print("EXP23 warning: no gate scores captured; falling back to tie-all")
+            return set()
+
+        global_scores = None
+        for score in gate_scores.values():
+            global_scores = score if global_scores is None else global_scores + score
+        assert global_scores is not None
+        k = min(ESFT_TOP_EXPERTS, int(global_scores.numel()))
+        hot = set(torch.topk(global_scores, k=k).indices.tolist())
+        with open(ESFT_AFFINITY_PATH, "w") as f:
+            json.dump(
+                {
+                    "hot_experts": sorted(hot),
+                    "top_experts": ESFT_TOP_EXPERTS,
+                    "profile_batches": ESFT_PROFILE_BATCHES,
+                    "layers_profiled": sorted(gate_scores),
+                    "global_scores": [float(v) for v in global_scores.tolist()],
+                },
+                f,
+                indent=2,
+            )
+        print(f"EXP23 selected hot experts: {sorted(hot)}")
+        return hot
+
+    HOT_EXPERTS = _profile_hot_experts()
+    # <<< EXP23 END
+
     # ── MoE tied-weight params (Tinker convention) ───────────────────
     # Tinker ties whichever LoRA side touches the hidden dim:
     #   gate_up_proj / up_proj / w1 / gate_proj  -> tie A (input/hidden side)
@@ -489,8 +604,23 @@ def run_training() -> None:
             """Make all 128 expert slices identical (mean-and-broadcast)."""
             with torch.no_grad():
                 for p in moe_tied_params:
-                    mean = p.data.mean(dim=0, keepdim=True)
-                    p.data.copy_(mean.expand_as(p.data))
+                    # >>> EXP23 START
+                    if ESFT_SELECT and HOT_EXPERTS:
+                        cold = [
+                            i for i in range(p.shape[0]) if i not in HOT_EXPERTS
+                        ]
+                        if cold:
+                            cold_t = torch.tensor(cold, dtype=torch.long, device=p.device)
+                            mean = p.data.index_select(0, cold_t).mean(
+                                dim=0, keepdim=True
+                            )
+                            p.data[cold_t] = mean.expand(
+                                len(cold), *p.data.shape[1:]
+                            )
+                    else:
+                        mean = p.data.mean(dim=0, keepdim=True)
+                        p.data.copy_(mean.expand_as(p.data))
+                    # <<< EXP23 END
 
         def _tie_grads() -> None:
             # Sum (not mean) across the expert dim: if W is the shared LoRA factor
@@ -505,10 +635,32 @@ def run_training() -> None:
                 for p in moe_tied_params:
                     if p.grad is None:
                         continue
-                    grad_sum = p.grad.sum(dim=0, keepdim=True)
-                    p.grad.copy_(grad_sum.expand_as(p.grad))
+                    # >>> EXP23 START
+                    if ESFT_SELECT and HOT_EXPERTS:
+                        cold = [
+                            i for i in range(p.shape[0]) if i not in HOT_EXPERTS
+                        ]
+                        if cold:
+                            cold_t = torch.tensor(cold, dtype=torch.long, device=p.device)
+                            grad_sum = p.grad.index_select(0, cold_t).sum(
+                                dim=0, keepdim=True
+                            )
+                            p.grad[cold_t] = grad_sum.expand(
+                                len(cold), *p.grad.shape[1:]
+                            )
+                    else:
+                        grad_sum = p.grad.sum(dim=0, keepdim=True)
+                        p.grad.copy_(grad_sum.expand_as(p.grad))
+                    # <<< EXP23 END
 
         print(f"MoE weight tying: {len(moe_tied_params)} params identified for tying")
+        # >>> EXP23 START
+        if ESFT_SELECT:
+            print(
+                "EXP23 ESFT tying: "
+                f"{len(HOT_EXPERTS)} hot experts untied, cold experts tied"
+            )
+        # <<< EXP23 END
         if moe_tied_params:
             print(f"  example shapes: {[tuple(p.shape) for p in moe_tied_params[:3]]}")
         _tie_param_init()  # start from a tied state
@@ -608,9 +760,7 @@ def run_training() -> None:
                 )
                 per_token_ce = model._cached_per_token_ce  # type: ignore[attr-defined]
                 weighted_loss = per_token_ce * padded_weights
-                # >>> EXP_WEIGHT_SIGN START
-                weight_sum_t = padded_weights.abs().sum()
-                # >>> EXP_WEIGHT_SIGN END
+                weight_sum_t = padded_weights.sum()
                 loss_sum_t = weighted_loss.sum()
                 loss = (
                     loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
