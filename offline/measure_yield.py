@@ -20,6 +20,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rollouts", default="rollouts.jsonl")
     p.add_argument("--problems_jsonl", default="nemotron-master/problems.jsonl")
     p.add_argument("--output", default="yield_report.json")
+    p.add_argument(
+        "--stage",
+        default="",
+        help="Optional rollout stage filter, e.g. probe or targeted",
+    )
     p.add_argument("--max_tokens", type=int, default=7680)
     p.add_argument("--trunc_epsilon", type=int, default=8)
     return p.parse_args()
@@ -53,6 +58,8 @@ def main() -> None:
 
     by_problem: dict[str, list[dict]] = defaultdict(list)
     for rec in read_rollouts(args.rollouts):
+        if args.stage and rec.get("stage") != args.stage:
+            continue
         pid = str(rec["problem_id"])
         rec["category"] = str(rec.get("category") or categories.get(pid, ""))
         by_problem[pid].append(rec)

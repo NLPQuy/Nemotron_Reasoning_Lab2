@@ -137,26 +137,64 @@
 
 ---
 
-## 4. `sample_rollouts.py` — generator GPU 1-lần (Milestone B)
+## 4. Lớp sampling (Milestone B) — **1 base-pass adaptive-G + các pass có điều kiện riêng**
 
-- **Mục tiêu:** sample G=8/bài toàn `train.csv` **một lần**, giữ MỌI group, lưu đủ để 5 generator hạ nguồn dùng chung.
-- **Port:** [generate_rollouts_vllm.py](../../generate_rollouts_vllm.py) — **giữ nguyên** load/engine/resume/CLI; chỉ refactor `process_batch` ([180-251](../../generate_rollouts_vllm.py#L180-L251)).
-- **3 thay đổi DUY NHẤT trong `process_batch`:**
-  1. **XOÁ** drop pure-group [L242-243](../../generate_rollouts_vllm.py#L242-L243) (`if len(set(rewards))<2: continue`). Giữ `mixed_rate` chỉ để LOG.
-  2. **THÊM `text`** vào record (raw completion text — RFT/compress cần): `"text": completion.text`.
-  3. **THÊM `ppl_approx`** = `ppl_from_logp(old_logp, mask)` (gọi `common.ppl`).
+> ⚠️ **Sửa quan niệm cũ:** KHÔNG phải "1 lượt G=8 nuôi mọi generator". Đúng là: **1 base-pass adaptive-G** (`sample_rollouts.py`) nuôi nhóm *hậu-xử-lý* (G1/G2/G3/G4); còn G6/G9/exp35 **mỗi cái có routine sampling RIÊNG** (prompt khác → không tái dùng được `rollouts.jsonl`). Hai lý do: thiếu **TYPE** (trajectory có điều kiện) và thiếu **DEPTH** (G=8 uniform quá nông cho category khó/mixed).
+
+### 4.0 Routing — generator nào tái dùng rollouts, generator nào cần pass riêng
+
+| Generator | Nguồn sampling | Vì sao |
+|---|---|---|
+| G1 `build_rft`, G2 `build_negatives`, G3 `build_reward_weighted`, G4 `build_dpo_pairs` | **tái dùng `rollouts.jsonl`** (hậu-xử-lý) | chỉ lọc/đánh-trọng-số trace base, không đổi prompt |
+| G6 `build_correction_traces` (exp34) | **pass riêng, 2 vòng** | turn2 = sample CÓ ĐIỀU KIỆN trên `[prompt + attempt-sai + "sửa đi"]` → prompt khác |
+| G9 `coldstart_inject` (exp35-assist) | **pass riêng** | prompt bị chèn k% lời-giải/skeleton → input khác hẳn base |
+| exp35 `self_improve` | **pass riêng, lặp** | sample trên bài (n+k)-bit **tổng-hợp** (không có trong train.csv) + adapter cập nhật mỗi vòng |
+
+→ Cả 3 pass riêng **gọi chung** core `common.vllm_engine.sample()` (đừng load engine nhiều lần — engine load ~vài phút; reuse cùng `llm` object trong 1 process nếu chạy nối tiếp). Mỗi cái tự build prompt rồi verify bằng `common.verify`.
+
+### 4.1 `sample_rollouts.py` — base-pass, **G thích ứng theo category** (HS-STaR / b-star budget)
+- **Mục tiêu:** harvest đủ DEPTH cho category cần nhất, không phí budget cho category đã bão hoà.
+- **Vấn đề của G=8 uniform** (số từ leaderboard/yield thực):
+
+  | Category | pass@1 | G=8 cho ra | Hệ quả |
+  |---|--:|---|---|
+  | numeral / gravity / unit_conv | 90–97% | ~8 đúng/bài | **thừa đúng, 0 cặp mixed** cho DPO |
+  | cipher / equation | 31–36% | vài đúng + vài sai | OK cho mixed-pair |
+  | bit_manipulation | 9.6% | **~0.8 đúng/bài** | **RFT đói** đúng category cần nhất |
+  | cryptarithm / *_guess | ~0% | 0 đúng | info-ceiling (chấp nhận, G nhỏ) |
+
+- **Thiết kế 2-stage:**
+  1. **Probe (rẻ):** G_probe=8 uniform toàn `train.csv` → đây CHÍNH là input cho `measure_yield` (§5.1) → ước `pass@1` mỗi **category** (và mỗi **bài** nếu muốn per-problem budget).
+  2. **Targeted:** đặt `G_cat` theo `p=pass@1`:
+     - `p ≥ 0.85` (numeral/gravity/unit): `G=2` — chỉ cần vài trace đúng, chủ yếu để có baseline.
+     - `0.15 ≤ p < 0.85` (cipher/equation): `G=24–32` — nguồn mixed-pair (DPO) + RFT giàu nhất.
+     - `0.02 ≤ p < 0.15` (bit_manip): `G=48–64` — bơm để hứng trace đúng hiếm cho RFT + tạo group mixed.
+     - `p < 0.02` (crypto/guess): `G=4` — info-ceiling, chỉ để xác nhận, không đổ budget; nhường cho G9 coldstart.
+  - **Per-problem boundary (tuỳ chọn, b-star/adastar):** trong category, dồn thêm sample cho bài probe ra **mixed** (vừa đúng vừa sai) — nơi tín hiệu học cao nhất; bớt cho bài pure-correct/pure-wrong.
+- **Budget — cap token-budget TỔNG (chốt):** đừng để `G_cat` cố định làm nổ giờ. Cơ chế:
+  1. từ probe, ước `avg_tok_cat` (token/trace trung bình mỗi category, từ `completion_token_ids`).
+  2. `--token_budget` (mặc định ~150M ≈ 3-5h RunPod). Tính `cost = Σ_cat (G_cat × N_cat × avg_tok_cat)`.
+  3. nếu `cost > token_budget`: scale `G_cat` xuống theo **thứ tự ưu tiên** (giữ category đói = bit/cipher/equation, cắt category đã-bão-hoà trước — chúng vốn `G` nhỏ nên cắt ít ảnh hưởng). KHÔNG scale đều tay (sẽ lại làm bit_manip đói).
+  4. log bảng `{category: G_final, est_tokens}` trước khi chạy để soi.
+  - **`G_cat` ở §4.1 là TRẦN ưu tiên, không phải số cứng** — budget cap có quyền hạ.
+- **Port + thay đổi trên [generate_rollouts_vllm.py](../../generate_rollouts_vllm.py)** (giữ load/engine/resume; refactor `process_batch` [180-251](../../generate_rollouts_vllm.py#L180-L251)):
+  1. **XOÁ** drop pure-group [L242-243](../../generate_rollouts_vllm.py#L242-L243). Giữ `mixed_rate` để LOG.
+  2. **THÊM `text`**: `"text": completion.text`.
+  3. **THÊM `ppl_approx`** = `ppl_from_logp(old_logp, mask)`.
+  4. **THÊM adaptive-G:** đọc `--g_schedule` (JSON `{category: G}` hoặc đường dẫn `yield_report.json` để tự suy) thay vì `n=args.group_size` cố định ([L184-190](../../generate_rollouts_vllm.py#L184-L190) tạo `SamplingParams` per-category).
+- **CLI:** `--mode probe|targeted`; `--g_schedule <json>`; `--token_budget 150000000`; giữ `--temperature 0.9 --resume --max_problems`; adapter mặc định = 0.86.
 - **Output `rollouts.jsonl` (1 dòng/completion):**
   ```jsonc
   {"problem_id","category","prompt_token_ids":[...],"completion_token_ids":[...],
    "text":"...reasoning...","pred":"...","answer":"...","reward":0|1,
-   "old_logp":[...],"ppl_approx":1.34}
+   "old_logp":[...],"ppl_approx":1.34,"stage":"probe|targeted"}
   ```
-- **CLI:** giữ flags cũ (`--group_size 8 --temperature 0.9 --resume --max_problems`). Mặc định adapter = 0.86.
 - **Gotcha:**
-  - Tách `prompt_token_ids` và `completion_token_ids` riêng (đừng nối sẵn) → downstream tự ghép qua `make_example_from_ids`.
-  - `old_logp` hiện gồm cả phần prompt (=0.0, [L224](../../generate_rollouts_vllm.py#L224)); `ppl_from_logp` chỉ lấy phần completion theo mask.
-- **Volume:** ~76k samples → feed `build_rft`/`build_negatives`/`build_reward_weighted`/`build_dpo_pairs`/`build_correction_traces`.
-- **CẤM:** đừng tạo file rollout riêng cho từng generator — **1 file dùng chung**.
+  - Tách `prompt_token_ids`/`completion_token_ids` riêng → downstream ghép qua `make_example_from_ids`.
+  - `old_logp` gồm phần prompt (=0.0, [L224](../../generate_rollouts_vllm.py#L224)); `ppl_from_logp` chỉ lấy completion theo mask.
+  - Probe + targeted ghi CÙNG file (append, field `stage` phân biệt) → resume an toàn.
+- **Volume:** probe ~76k + targeted dồn vào bit/cipher/equation → tổng ~150–250k tuỳ schedule (bound bằng token budget RunPod ~3-5h).
+- **CẤM:** dùng G cố định cho mọi category (làm `build_rft` đói bit_manip); load engine lại cho mỗi pass có điều kiện (reuse `sample()` core).
 
 ---
 
@@ -232,11 +270,13 @@
 - **Falsify:** vs CE thuần +0.5pp macro; reward thưa (measure_yield) → bỏ.
 - **CẤM:** importance-weight clipping kiểu GSPO (chỗ exp27 degenerate).
 
-### 5.7 Milestone D — spec ngắn (code sau, dùng lại rollouts)
-- `build_dpo_pairs.py` (exp31/32): mixed-group → (chosen=gold/correct, rejected=wrong); **step-dpo** ([refs/step-dpo](../../refs/step-dpo)) cho bit_manip: solver biết **bước lệch đầu** ([plan §16.1](plan-batch-4.md)) → cặp share-prefix, không cần critic-LLM. Output `pairs.jsonl`; **cần thêm DPO objective vào Continuer** (milestone riêng, không trộn vào PR này).
-- `build_correction_traces.py` (exp34): [self-rewarding infer_math](../../refs/self-rewarding-correction/infer_math/) turn1→`compare_answer`-label→turn2-sửa→merge; template `attempt→[VERIFY] wrong.→<sửa>→[VERIFY] correct.→\boxed{}`; **mask phần attempt sai** (weight=0 cho token attempt).
-- `coldstart_inject.py` (exp35-assist): [questa process.py](../../refs/questa/AReaL/datasets/process.py) prepend k% gold-token vào prompt khi GEN → verify-keep completion đầy đủ. Chỉ lúc gen.
-- `synth_weakness.py` (exp36): [sws data_synthesis.py](../../refs/sws/src/data_synthesis.py) concept co-occurrence từ `failure_cases.jsonl` (P0) → generator repo sinh tổ-hợp operator hay-trượt.
+### 5.7 Milestone D — spec ngắn (code sau)
+> Phân loại theo §4.0: `build_dpo_pairs` **tái dùng** targeted-rollouts; còn `build_correction_traces`/`coldstart_inject`/`synth_weakness`+exp35 **cần pass sampling RIÊNG** (gọi `common.vllm_engine.sample`), KHÔNG hậu-xử-lý `rollouts.jsonl`.
+- `build_dpo_pairs.py` (exp31/32) — **tái dùng rollouts**: mixed-group → (chosen=gold/correct, rejected=wrong); **step-dpo** ([refs/step-dpo](../../refs/step-dpo)) cho bit_manip: solver biết **bước lệch đầu** ([plan §16.1](plan-batch-4.md)) → cặp share-prefix, không cần critic-LLM. Output `pairs.jsonl`; **cần thêm DPO objective vào Continuer** (milestone riêng). ⚠️ Cặp mixed chỉ dồi dào ở cipher/equation/gravity — phụ thuộc targeted-G (§4.1) để có cặp ở bit_manip.
+- `build_correction_traces.py` (exp34) — **PASS RIÊNG 2 vòng**: vòng1 = lấy trace SAI từ rollouts; vòng2 = `sample()` lại với prompt `[gốc + attempt-sai + "sửa đi"]` ([self-rewarding infer_math](../../refs/self-rewarding-correction/infer_math/) `process_prompt_turn2`); label bằng `compare_answer`; merge template `attempt→[VERIFY] wrong.→<sửa>→[VERIFY] correct.→\boxed{}`; **mask phần attempt sai** (weight=0 cho token attempt).
+- `coldstart_inject.py` (exp35-assist) — **PASS RIÊNG**: `sample()` với prompt chèn k% gold-token/skeleton ([questa process.py](../../refs/questa/AReaL/datasets/process.py)) → verify-keep completion đầy đủ. Chỉ lúc gen (submission vẫn greedy thuần). Nhắm bit_manip-gap + equation hard.
+- `self_improve.py` (exp35) — **PASS RIÊNG, LẶP**: sinh bài (n+k)-bit tổng-hợp → `sample()` → verify-keep → train → lặp với adapter mới. Length-generalization; stop-rule hội tụ (auto-cei [plan §17.2](plan-batch-4.md)).
+- `synth_weakness.py` (exp36) — **CPU**: concept co-occurrence từ `failure_cases.jsonl` (P0) → generator repo sinh tổ-hợp operator hay-trượt ([sws data_synthesis.py](../../refs/sws/src/data_synthesis.py)).
 
 ---
 
@@ -261,12 +301,14 @@
 | Bậc | Lệnh | GPU | Time |
 |---|---|:--:|---|
 | 0 | `compress_traces` + `evolve_solved` (CPU, song song) | ✗ | máy thường |
-| 1 | `sample_rollouts.py --group_size 8` (1 lần) | ✓ | ~3-5h ([ước tính](../../generate_rollouts_vllm.py#L8-L10)) |
-| 1' | `measure_yield` | ✗ | giây |
-| 2 | `build_rft`/`build_negatives`/`build_reward_weighted` (cùng rollouts) | ✗ | phút |
+| 1a | `sample_rollouts.py --mode probe` (G=8 uniform) | ✓ | ~1h |
+| 1b | `measure_yield` → suy `g_schedule` per-category | ✗ | giây |
+| 1c | `sample_rollouts.py --mode targeted --g_schedule yield_report.json` (G lớn cho bit/cipher/eq) | ✓ | ~3-5h |
+| 2 | `build_rft`/`build_negatives`/`build_reward_weighted` (tái dùng rollouts) | ✗ | phút |
 | 3 | `upload_kaggle` → Continuer continue-0.86 (`RESET_WEIGHTS=False`, LR 1e-5–5e-5, NUM_STEPS giảm) | ✓ | train |
+| (D) | `build_correction_traces` / `coldstart_inject` / `self_improve` | ✓ | **mỗi cái pass sampling riêng** (§4.0) |
 
-**1 GPU-pass (`sample_rollouts`) nuôi 4 generator** — điểm tiết kiệm chính.
+**Base-pass adaptive-G nuôi G1–G4 (hậu-xử-lý);** G6/G9/exp35 = pass có điều kiện riêng. Tiết kiệm = reuse `vllm_engine` core + ghi chung `rollouts.jsonl`, KHÔNG phải "1 lượt nuôi tất cả".
 
 ---
 
