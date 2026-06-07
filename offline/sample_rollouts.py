@@ -358,13 +358,25 @@ def log_schedule(
     print(f"estimated_completion_tokens={total:.0f} token_budget={args.token_budget}")
 
 
+def _as_token_id_list(value: Any) -> list[int]:
+    if isinstance(value, dict):
+        value = value.get("input_ids", value.get("prompt_token_ids", value))
+    if hasattr(value, "input_ids"):
+        value = value.input_ids
+    if value and isinstance(value, list) and isinstance(value[0], list):
+        value = value[0]
+    return [int(token_id) for token_id in value]
+
+
 def _prompt_ids_for_rows(rows: list[dict], tokenizer: Any) -> list[list[int]]:
     return [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": row["prompt"] + PROMPT_SUFFIX}],
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
+        _as_token_id_list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": row["prompt"] + PROMPT_SUFFIX}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
         )
         for row in rows
     ]

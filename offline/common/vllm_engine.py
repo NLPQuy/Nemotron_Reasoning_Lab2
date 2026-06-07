@@ -52,7 +52,10 @@ def sample(
         max_tokens=max_tokens,
         logprobs=logprobs,
     )
-    prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
+    prompts = [
+        TokensPrompt(prompt_token_ids=[int(token_id) for token_id in ids])
+        for ids in prompt_token_ids
+    ]
     return llm.generate(
         prompts,
         sampling_params=sampling_params,
