@@ -43,6 +43,7 @@ def sample(
     logprobs: int = 1,
 ) -> Any:
     from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
 
     sampling_params = SamplingParams(
         n=n,
@@ -51,8 +52,9 @@ def sample(
         max_tokens=max_tokens,
         logprobs=logprobs,
     )
+    prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
     return llm.generate(
-        prompt_token_ids=prompt_token_ids,
+        prompts,
         sampling_params=sampling_params,
         lora_request=lora_request,
     )
