@@ -76,7 +76,7 @@ pip install -U \
     nvidia-cuda-nvrtc \
     nvidia-cuda-nvcc \
     nvidia-cublas \
-    nvidia-cudnn-cu13
+    "nvidia-cudnn-cu13==9.19.0.56"
 
 CUDA_HOME=$(python3 - <<'PY'
 import glob
