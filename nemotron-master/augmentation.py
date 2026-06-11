@@ -15,7 +15,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from augmenters import concatenation, lstrip, matching, splitting, spelling
+# >>> EXP28 START — drop all off-distribution augmenters (no \boxed{}, no reasoning).
+# In-distribution mini-tasks are added via generate_instances.py instead.
+# Rollback: uncomment the two import blocks below and the .generate() calls in main().
+# from augmenters import concatenation, lstrip, matching, splitting, spelling
+# from augmenters import char_index, count_substring, digit_extract, reverse
+# <<< EXP28 END
 
 OUTPUT_DIR = Path(__file__).parent / "augmentations"
 
@@ -23,11 +28,17 @@ OUTPUT_DIR = Path(__file__).parent / "augmentations"
 def main() -> None:
     problems: list[dict[str, str]] = []
 
-    problems.extend(spelling.generate())
-    problems.extend(concatenation.generate())
-    problems.extend(splitting.generate())
-    problems.extend(matching.generate())
-    problems.extend(lstrip.generate())
+    # >>> EXP28 START — all off-distribution augmenter calls disabled.
+    # problems.extend(spelling.generate())
+    # problems.extend(concatenation.generate())
+    # problems.extend(splitting.generate())
+    # problems.extend(matching.generate())
+    # problems.extend(lstrip.generate())
+    # problems.extend(reverse.generate())
+    # problems.extend(count_substring.generate())
+    # problems.extend(char_index.generate())
+    # problems.extend(digit_extract.generate())
+    # <<< EXP28 END
 
     if OUTPUT_DIR.exists():
         import shutil

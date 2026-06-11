@@ -13,7 +13,7 @@ from reasoners.store_types import Problem
 
 N_BITS = 8
 
-SYM_FAMILIES = ("XOR", "OR", "AND")
+SYM_FAMILIES = ("XOR", "OR", "AND", "NAND", "NOR")
 ASYM_FAMILIES = ("AND-NOT", "XOR-NOT", "OR-NOT")
 PAIR_FAMILIES = SYM_FAMILIES + ASYM_FAMILIES
 UNARY_FAMILIES = ("I", "NOT")
@@ -29,6 +29,8 @@ SECTION_ORDER = (
     "AND-NOT",
     "OR-NOT",
     "XOR-NOT",
+    "NAND",
+    "NOR",
 )
 
 # Map section names to their constituent family codes.
@@ -56,6 +58,8 @@ RuleFamily = Literal[
     "AND-NOT",
     "XOR-NOT",
     "OR-NOT",
+    "NAND",
+    "NOR",
     "DEFAULT",
 ]
 
@@ -121,6 +125,10 @@ def _evaluate_binary(a: str, b: str, family: str) -> str:
         return "1" if a == "1" or b == "1" else "0"
     if family in ("XOR", "XOR-NOT"):
         return "1" if a != b else "0"
+    if family == "NAND":
+        return "0" if a == "1" and b == "1" else "1"
+    if family == "NOR":
+        return "0" if a == "1" or b == "1" else "1"
     raise ValueError(f"Unsupported family {family}")
 
 
@@ -406,10 +414,12 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
     input_columns = [_column_bits(inputs, i) for i in range(N_BITS)]
     input_inverted = [_invert(col) for col in input_columns]
 
+    # >>> EXP27 START — NAND/NOR added to SECTION_ORDER, auto-included here
     all_records: Dict[str, List[Record]] = {name: [] for name in SECTION_ORDER}
     all_matches: Dict[str, List[List[RuleCandidate]]] = {
         name: [[] for _ in range(N_BITS)] for name in SECTION_ORDER
     }
+    # <<< EXP27 END
 
     # Build unary records and matches.
     for out_idx, out_col in enumerate(output_columns):
@@ -463,7 +473,7 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
 
     # Build pair records (ordered by circular difference for symmetric ops).
     fam: RuleFamily
-    for fam in ("XOR", "OR", "AND"):
+    for fam in ("XOR", "OR", "AND", "NAND", "NOR"):
         for circ_diff in range(1, N_BITS // 2 + 1):
             # For circ_diff == N_BITS/2, only half the circle to avoid duplicates
             n_pairs = N_BITS // 2 if circ_diff == N_BITS // 2 else N_BITS

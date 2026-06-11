@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import csv
 import json
-import re
 import shutil
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from reasoning import compare_answer, extract_answer
 from tokenizers import Tokenizer  # type: ignore[import-untyped]
 from transformers import AutoTokenizer  # type: ignore[import-untyped]
 
@@ -41,6 +42,18 @@ PROMPT_SUFFIX = (
 )
 
 TOKEN_LIMIT = 8192
+
+# >>> EXP21 START
+VERIFY_GATE = True
+LENGTH_GATE = True
+# Global anti-truncation cap: drop only traces whose completion cannot be produced
+# within the 7680-token output budget at inference. Set just under that budget so it
+# is a pure safety wrapper (drops ~0% of current correct traces) and only fires on
+# genuinely over-budget augmented traces. Not a per-category concision knob — keeps
+# all in-distribution short traces (see plan-batch-3 §exp21). Lower it deliberately
+# (e.g. 7000) only if you want a concision margin, accepting it trims long categories.
+GLOBAL_LENGTH_CAP = 7600
+# <<< EXP21 END
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -133,6 +146,14 @@ def build_segments(
     return segments
 
 
+# >>> EXP21 START
+def build_reasoning_completion(reasoning_text: str, reasoning_answer: str) -> str:
+    return f"{reasoning_text}\n</think>\n\\boxed{{{reasoning_answer}}}<|im_end|>"
+
+
+# <<< EXP21 END
+
+
 def main() -> None:
     if not PROBLEMS_INDEX.exists():
         print(f"No {PROBLEMS_INDEX} found. Run problems.py first.")
@@ -173,19 +194,35 @@ def main() -> None:
         if (REASONING_DIR / f"{pid}.txt").exists() and pid in prompts
     )
 
+    # >>> EXP21 START
+    dropped_wrong: dict[str, int] = defaultdict(int)
+    dropped_long: dict[str, int] = defaultdict(int)
+    seen_reasoning: dict[str, int] = defaultdict(int)
+    # <<< EXP21 END
+
     for problem_id in problem_ids:
         category = problem_cats[problem_id]
         answer = answers[problem_id]
+        # >>> EXP21 START
+        seen_reasoning[category] += 1
+        # <<< EXP21 END
 
         reasoning_text = (REASONING_DIR / f"{problem_id}.txt").read_text().rstrip("\n")
 
         # Extract answer from reasoning's \boxed{} so they match
-        boxed_match = re.findall(r"\\boxed\{([^}]*)\}", reasoning_text)
-        reasoning_answer = boxed_match[-1] if boxed_match else answer
-        completion_text = (
-            f"{reasoning_text}\n</think>\n\\boxed{{{reasoning_answer}}}<|im_end|>"
-        )
+        reasoning_answer = extract_answer(reasoning_text)
+        # >>> EXP21 START
+        if VERIFY_GATE and not compare_answer(answer, reasoning_answer):
+            dropped_wrong[category] += 1
+            continue
+        # <<< EXP21 END
+        completion_text = build_reasoning_completion(reasoning_text, reasoning_answer)
         completion_ids = tokenizer.encode(completion_text, add_special_tokens=False).ids
+        # >>> EXP21 START
+        if LENGTH_GATE and len(completion_ids) > GLOBAL_LENGTH_CAP:
+            dropped_long[category] += 1
+            continue
+        # <<< EXP21 END
 
         # Tokenize prompt directly (no raw/ dependency)
         prompt_ids = tokenize_prompt(prompts[problem_id], chat_tokenizer)
@@ -299,6 +336,24 @@ def main() -> None:
     print(f"Unmasked tokens: {total_unmasked:,}")
     print(f"Masked tokens:   {total_masked:,}")
     print(f"Max seq length:  {max_tokens:,}")
+    # >>> EXP21 START
+    if VERIFY_GATE or LENGTH_GATE:
+        print()
+        print("EXP21 gate:")
+        print(f"  VERIFY_GATE={VERIFY_GATE}")
+        print(f"  LENGTH_GATE={LENGTH_GATE}")
+        print(f"  GLOBAL_LENGTH_CAP={GLOBAL_LENGTH_CAP}")
+        for cat in sorted(seen_reasoning):
+            seen = seen_reasoning[cat]
+            wrong = dropped_wrong.get(cat, 0)
+            long = dropped_long.get(cat, 0)
+            wrong_pct = wrong / seen * 100 if seen else 0.0
+            long_pct = long / seen * 100 if seen else 0.0
+            print(
+                f"  {cat}: seen={seen}, dropped_wrong={wrong} ({wrong_pct:.2f}%), "
+                f"dropped_long={long} ({long_pct:.2f}%)"
+            )
+    # <<< EXP21 END
     print()
     for cat in sorted(cat_counts):
         print(f"  {cat}: {cat_counts[cat]} runs, {cat_tokens[cat]:,} unmasked tokens")
