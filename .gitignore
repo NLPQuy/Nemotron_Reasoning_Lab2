@@ -16,3 +16,5 @@ nemotron-master/training/
 nemotron-master/kaggle_snapshot/
 nemotron-master/kaggle_snapshot_exp*/
 tracker/
+enhance_cot/
+experiments/
