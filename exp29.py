@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP29 START
+# EXP29 - REDI negatives over full solver anchor plus mined positives.
+# Knobs: continue adapter, LR=1e-5, NUM_STEPS=298, lambda=0.8, CORPUS_PATH=mix_redi.
+# Rollback: drop N_neg or reduce lambda to 0.4 if format_rate_wrong rises.
+# >>> EXP29 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,23 +13,28 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
+# >>> EXP29 START
 NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
 NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
+# >>> EXP29 END
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
+# >>> EXP29 START
+LEARNING_RATE = 1e-5
+RESET_WEIGHTS = False
+EXP29_MODAL_CORPUS_PATH = "/data/corpus/mix_redi.jsonl"
+# >>> EXP29 END
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
-SHUFFLE_DATASET = False
+SHUFFLE_DATASET = True
 
-KAGGLE_DATASET = "huikang/nemotron-data"
+# >>> EXP29 START
+KAGGLE_DATASET = "huikang/nemotron-exp29-redi"
+# >>> EXP29 END
 MINUTES = 60
 
 TARGET_MODULES = [
@@ -114,6 +124,9 @@ def run_training() -> None:
 
         CORPUS_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/tokens"
         TRAIN_ORDER_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/logprobs/index.jsonl"
+        # >>> EXP29 START
+        CORPUS_PATH = "/kaggle/input/datasets/ngoczhu/nemotron-mixes/mix_redi.jsonl"
+        # >>> EXP29 END
         TRAIN_CSV_PATH = "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge/train.csv"
         # >>> KAGGLE_ADAPTER START
         # 0.86 adapter as loose Kaggle dataset (no unzip). ADAPTER_SRC is read-only
@@ -126,6 +139,9 @@ def run_training() -> None:
     else:  # IS_MODAL_WORKER
         MODEL_PATH = "unsloth/Nemotron-3-Nano-30B-A3B"
         CORPUS_PATH = "/data/corpus_preprocessed.jsonl"
+        # >>> EXP29 START
+        CORPUS_PATH = EXP29_MODAL_CORPUS_PATH
+        # >>> EXP29 END
         TRAIN_CSV_PATH = "/data/train.csv"
         ADAPTER_SRC = "/merged/weights"
         OUTPUT_DIR = "/output/weights"

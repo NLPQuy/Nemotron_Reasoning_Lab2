@@ -1,6 +1,6 @@
 # Leaderboard Tracker
 
-Target: **0.88+** | Current best: **0.86** (baseline, tied by exp21)
+Target: **0.88+** | Current best: **0.86** (baseline; tied by exp21, exp40, exp42, exp43)
 
 | Round | Exp | Score | Δ vs baseline | Config summary | Notes |
 |-------|-----|-------|---------------|----------------|-------|
@@ -43,6 +43,63 @@ via STaR / augment-solved→harder) — see [research/offline_rl_cot_sota.md](..
 
 ---
 
+## Batch-4 status (exp29–exp39) — data-mix on top of 0.86 (post shuffle/epoch fix)
+
+All exps continue-train the 0.86 adapter (`RESET_WEIGHTS=False`, `LR=1e-5`, 1 epoch,
+`SHUFFLE_DATASET=True`) on a rebuilt `build_corpus.py` mix. Scores below are **post**-shuffle-fix
+(2026-06-10); they supersede the pre-fix artifacts (exp30=0.65 / exp34=0.64).
+
+| Exp | Idea | Corpus | Score | Δ vs baseline |
+|---|---|---|---|---|
+| exp29 | EXP-C REDI negatives (λ=0.8, sign=−1) | mix_redi | **0.37** | −0.49 |
+| exp33 | EXP-B TokenSkip compress bit_manip | mix_tokenskip | 0.62 | −0.24 |
+| exp30 | EXP-D A★-PO reward-weighted | mix_apo | 0.70 | −0.16 |
+| exp32 | EXP-F Step-localized REDI | mix_stepneg | 0.70 | −0.16 |
+| exp34 | EXP-G self-correction | mix_correction | 0.70 | −0.16 |
+| exp38 | EXP-A RFT-mined (clean additive) | mix_rft | 0.72 | −0.14 |
+| exp39 | EXP-J AdaSTaR difficulty-reweight | mix_adastar | 0.72 | −0.14 |
+| exp35 | EXP-H length curriculum (best) | mix_length | 0.74 | −0.12 |
+| exp36 | EXP-I SwS weakness synthesis | mix_weakness | pending | — |
+| exp37 | EXP-E evolve/SAND harder variants | mix_evolve | pending | — |
+
+**Takeaway — the mix-corpus *pipeline* regresses, not just individual ideas.** Even the safest
+pure-additive levers with no negatives/compression (exp38 RFT, exp39 AdaSTaR reweight) land at
+**0.72**, and the best of the whole batch (exp35) is **0.74** — all far below 0.86, *after* the
+shuffle/epoch bug was fixed. Continue-training the 0.86 adapter for 1 epoch on a rebuilt mix
+replaces the full curated ~50.5M-token corpus + curated training order with a smaller/re-ordered
+mix → **coverage erosion** dominates any lever gain. exp29's catastrophic **0.37** confirms
+`sign=−1` negatives at λ=0.8 poison on top (gradient-ascent on wrong traces). **Verdict: data-mix-
+on-top-of-0.86 via this `build_corpus` path is a dead direction as built.** Next: either (a) verify
+the mix contains the FULL original corpus untouched (token-count vs 50.5M) with the lever strictly
+*additive*, or (b) abandon continue-on-mix and move coverage to the solver source (Tier-0
+cryptarithm/guess in `nemotron-master/reasoners/`).
+
+---
+
+## Batch-5 status (exp40–exp47) — continue-train from 0.86 (RESET_WEIGHTS=False, LR=1e-5, 1 epoch, order kept)
+
+Observation-driven batch (drawn from exp1–39): all continue-train the 0.86 adapter while keeping the
+full ~50.5M-token corpus + curated order. **Levers that DON'T touch the corpus tie 0.86; every
+corpus-modifying lever regresses** — same coverage-erosion pattern as Batch-4, seen from a new angle.
+
+| Exp | Idea (Batch-5) | Touches corpus? | Score | Δ vs baseline | Verdict |
+|---|---|---|---|---|---|
+| **exp43** | **D10 localized continue-train (in_proj/out_proj only)** | no | **0.86** | 0.00 | **= baseline (best of batch)** |
+| exp40 | D5 EMA + warmup/cosine-floor + clip=1.0 + grad-accum fix | no | 0.86 | 0.00 | = baseline |
+| exp42 | D9 anchored-L2 toward θ_0.86 (λ=1e-3) | no | 0.86 | 0.00 | = baseline |
+| exp41 | D11 Muon optimizer (LoRA 2D) + AuxAdam | no | 0.78 | −0.08 | regress |
+| exp47 | D4 quality-gate corpus + anchored-L2 | YES | 0.70 | −0.16 | regress |
+| exp44 | D1 bit-shorten corpus + anchored-L2 | YES | 0.66 | −0.20 | regress |
+
+**Takeaway:** re-confirms the 0.86 plateau from a fresh angle. The three levers that keep the corpus
+intact and only change the *optimization* (EMA package, anchored-L2, localized freeze) all **hold
+0.86 exactly — none exceed it**. The two that **edit the corpus** (bit-shorten D1, quality-gate D4)
+regress hard (0.66 / 0.70) *even with* the anchored-L2 safety net — coverage erosion dominates again.
+Muon (exp41, 0.78) is the only non-corpus lever that hurt: swapping the optimizer off AdamW is net
+negative at this scale. **Net: still no config > 0.86 across Batch-1/2/3/4/5.**
+
+---
+
 ## Score history (chronological)
 
 - **2026-06-01** — baseline `0.86` (pretrained adapter, default config)
@@ -55,6 +112,8 @@ via STaR / augment-solved→harder) — see [research/offline_rl_cot_sota.md](..
 - **2026-06-02** — exp9 `DNF` (spaced-repetition — training timeout)
 - **2026-06-02** — exp10 `0.84` (SA difficulty curriculum)
 - **2026-06-03** — exp21 `0.86` (LoRA+ split A/B LR — ties baseline; rest of Batch-3 regressed)
+- **2026-06-10** — Batch-4 data-mix (post shuffle/epoch fix): exp35 `0.74` (best), exp38/exp39 `0.72`, exp30/exp32/exp34 `0.70`, exp33 `0.62`, exp29 `0.37` — all regress; mix-corpus pipeline erodes baseline coverage (exp36/exp37 pending)
+- **2026-06-10** — Batch-5 continue-train from 0.86: exp43/exp40/exp42 `0.86` (tie — no corpus change: localized-freeze / EMA-package / anchored-L2), exp41 `0.78` (Muon optimizer), exp47 `0.70` (quality-gate corpus) / exp44 `0.66` (bit-shorten corpus) — corpus-editing levers regress even with anchored-L2; plateau holds at 0.86
 
 ---
 

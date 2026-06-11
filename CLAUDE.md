@@ -15,10 +15,18 @@ The matching **implementation plan** lives alongside each batch as `plan-batch-<
 | 1 | [batch-1.md](research/ideation/batch-1.md) | 10 (format-verified labels, answer-upweight, concise traces, rsLoRA, module realloc, LIMO curation, STaR/RFT, hot-expert untying, spaced-repetition, SA-curriculum) | 0.86 → 0.87 | exp1–exp10 generated, evaluated |
 | 2 | [batch-2.md](research/ideation/batch-2.md) | 9 (DoRA, NEFTune, self-verify traces, PiSSA init, arithmetic scratchpad, anchored-KL SFT, LoRA seed-soup, preference opt, Stream-of-Search) | 0.86 → 0.88+ | exp11–exp19 generated |
 | 3 | [batch-3.md](research/ideation/batch-3.md) | 8 (forking-token loss weighting, LoRA+ split LR, DoReMi mixture reweight, ESFT expert-specialized LoRA, CSP guess-solver, GroupDRO worst-category, HER forward-generation, GSPO) | 0.86 → 0.88+ | exp20–exp27 generated, evaluated |
+| 4 | [plan-batch-4-data-mix.md](research/ideation/plan-batch-4-data-mix.md) | 10 (RFT-mined, A★-PO reward-weight, REDI negatives, step-localized REDI, TokenSkip compress, self-correction, length curriculum, SwS weakness, evolve/SAND, AdaSTaR reweight) | 0.86 → 0.88+ | exp29–exp39 generated, **evaluated — all regressed (best exp35 0.74 ≪ 0.86)** |
+| 5 | [batch-5.md](research/ideation/batch-5.md) + [plan-batch-5.md](research/ideation/plan-batch-5.md) | 11 (D1 bit-shorten, D2 keep-boxed-tail, D3 cryptarithm coverage, D4 quality-gate, D5 EMA/warmup/clip, D6 guess-CSP, D7 WiSE-FT interp, D8 2×0.86 soup, D9 anchored-L2→0.86, D10 module-localized, D11 Muon) | 0.86 → 0.88+ | **observation-driven** (rút từ exp1–39); regime = continue-train từ 0.86; exp40–48 + soup. refs: `muon`, `lion-pytorch` cloned |
+| 6 | [batch-6.md](research/ideation/batch-6.md) + [plan-batch-6.md](research/ideation/plan-batch-6.md) | LoRA-architecture + Đợt-4 deployable replacements (B6-14 MoSLoRA, B6-15 coverage, B6-16 SBoRA) | 0.86 → 0.88+ | **10 repos cloned to `refs/`** (hira, mambapeft, ssm-state-tuning, adamoe, ld-mole, lora-pro, flat-lora, milora, bitfit, **moslora**). **plan triaged by vLLM-deploy constraint** (submission = rank-32 additive LoRA on pristine base): CODE = exp48 Freeze-A / exp49 Flat-LoRA / exp50 partial-SSM / exp52 LoRA-Pro / exp53 dropout; **exp54 MoSLoRA = NO-GO/near-free** (deep-research: PEFT-maintainer 20-run repro = no diff vs LoRA, paper never tested text-math); **exp51 router-LoRA = KILLED** (mixer.gate not in vLLM supported_lora_modules → silently ignored); **BLOCK = HiRA, MoRA, ReLoRA/COLA, LoRA-GA/CorDA/KaSA/PiSSA, nonlinear-LoRA, SSM-offset, MiLoRA, BitFit**. **MANDATORY PROBE-0 first**: load the 0.86 adapter under grader's exact vLLM, check which modules actually apply — vLLM applies expert-LoRA only ≥v0.11.2 (PR #21229), so the 0.86 adapter's expert deltas MAY be silently dropped. Coverage = only surviving capacity lever; vLLM exposes in_proj as in_proj_z/qkv/ba |
+| 7 | [batch-7.md](research/ideation/batch-7.md) + [plan-batch-7.md](research/ideation/plan-batch-7.md) + [batch-7-search-log.md](research/ideation/batch-7-search-log.md) | **Scope chốt 2026-06-11: ZERO-TRAIN, fusion-only.** Ingredients đủ = **5 adapter 0.86 trong 1 Kaggle dataset** (double-nested `expN-0-86/expN-0-86/`; exp32 = bạn-của-user, lineage ngoài-repo → diversity tốt). **Deliverable = 13 file fusion self-contained `exp58.py`–`exp70.py`** (đúng quy ước exp1–57: inline lõi fuse + block `# >>> EXP<N>` chứa POOL/mode/params → ghi `/kaggle/working/submission` → zip): exp58 uniform-soup, exp59 Model-Stock, exp60 LoRA-LEGO, exp61 SeedLoRA, exp62 WiSE-FT, exp63 scale, exp64 DisTaC-normeq, exp65 graft, exp66 TIES/DARE-SVD, exp67 subset-select, exp68 small-α, **exp69 KnOTS (joint-SVD align→TIES, refs/knots), exp70 Core-Space (LoRA-native core-Tr×Tr merge, refs/core-space)** — cả 2 zero-train data-free. Train-based ideas (re-seed/tail-ckpt/anneal/IterIS/LoRI) **DROP**. Lõi cũng có bản `offline/merge_lora.py` để test local. | 0.86 → 0.88+ | **deep-research + venue-verified 4-agent sweep**. Key finding: `soup_adapters.py` averages lora_A/lora_B factors separately = "Direct Merging" — WRONG (cross-terms; B·A invariant to (B·s, s⁻¹·A)); correct = **avg BA products then SVD-truncate to rank 32**. exp17 regression confounded by this. **Validate offline only** (deploy_check + `diag`: trunc-energy/drift/ingredient-cosine); **Kaggle có NO vLLM nên accuracy CHỈ qua leaderboard** (~5/day → submit best-first, exp58 trước). **PHẦN 6 of plan = full from-paper pseudocode** (SeedLoRA Eq.4-8, LoRA-LEGO MSU k-means, Model Stock `t=N·cosθ/((N-1)cosθ+1)`, DisTaC norm-rescale). refs/: model-soups, wise-ft, mergekit, knots, ties-merging, mergelm-dare, core-space, lorahub, model-stock, iteris, lori, distac, coto. **SeedLoRA & LoRA-LEGO repos confirmed codeless** |
 
 Batch 3's plan is [plan-batch-3.md](research/ideation/plan-batch-3.md); its live-search provenance is in [batch-3-search-log.md](research/ideation/batch-3-search-log.md).
 
-**Empirical verdict so far (see [tracker/leaderboard.md](tracker/leaderboard.md)):** every evaluated single-stage LoRA/objective tweak across Batch-1/2/3 has been ≤ 0.86 — `exp21` (LoRA+ split A/B LR, `LORAPLUS_LR_RATIO=8.0`) is the **only** non-baseline config that *ties* 0.86; everything else regressed. The conclusion recorded in the tracker is that the LoRA recipe is **not** the bottleneck. New work should pivot to bottleneck-targeted directions (selective-token / reward-weighted SFT, CoT compression, coverage-expansion via STaR / augment-solved→harder, and solving the unsolved *guess* categories) — see [research/offline_rl_cot_sota.md](research/offline_rl_cot_sota.md) and [research/cryptarithm_gap_plan.md](research/cryptarithm_gap_plan.md). Do not re-run exhausted single-knob LoRA tweaks expecting a different result.
+**Empirical verdict so far (see [tracker/leaderboard.md](tracker/leaderboard.md)):** every evaluated single-stage LoRA/objective tweak across Batch-1/2/3 has been ≤ 0.86 — `exp21` (LoRA+ split A/B LR, `LORAPLUS_LR_RATIO=8.0`) is the **only** non-baseline config that *ties* 0.86; everything else regressed. The conclusion recorded in the tracker is that the LoRA recipe is **not** the bottleneck.
+
+**Batch-4 verdict (2026-06-10) — data-mix-on-top-of-0.86 is a dead direction as built.** All 8 evaluated batch-4 mixes regressed (best exp35 0.74, even clean-additive exp38 RFT / exp39 reweight only 0.72; exp29 REDI negatives catastrophic 0.37) — *after* the shuffle/epoch bug was fixed. Continue-training the 0.86 adapter for 1 epoch on a rebuilt `build_corpus` mix replaces the full curated ~50.5M-token corpus + curated training order with a smaller/re-ordered mix → **coverage erosion** dominates any lever gain. See [tracker/leaderboard.md](tracker/leaderboard.md) Batch-4 section.
+
+**→ Next direction (decided 2026-06-10): go back to the ORIGINAL corpus.** Do *not* continue-train on `build_corpus` subset mixes. Any improvement must keep the **full curated ~50.5M-token corpus + its curated training order intact** and add value at the **source** — i.e. grow/fix the corpus inside `nemotron-master/` (`reasoners/` solvers, `augmenters/`), especially Tier-0 coverage of the 100%-unsolved `cryptarithm_guess` / `equation_numeric_guess` and the cryptarithm/bit zero-problems — then regenerate the full corpus via the `nemotron-master/` pipeline (`reasoning.py → corpus.py`), not a mix. Solver-source coverage is the only direction with a positive datapoint (see [research/cryptarithm_gap_plan.md](research/cryptarithm_gap_plan.md), [research/offline_rl_cot_sota.md](research/offline_rl_cot_sota.md)). Do not re-run exhausted single-knob LoRA tweaks or build_corpus mixes expecting a different result.
 
 **Batch-2 recommended run order** (from [plan-batch-2.md](research/ideation/plan-batch-2.md)):
 1. **First** — bank cheap LoRA-capacity wins: `exp11` (DoRA) + `exp14` (PiSSA init); also probe `exp12` (NEFTune) as near-free regularizer.
@@ -119,7 +127,7 @@ When an experiment yields a leaderboard score:
 1. Copy `tracker/rounds/round_template.md` → `tracker/rounds/round_<N>.md` and fill in every field (rounds run `round_1`…`round_12` so far).
 2. Append the result row to `tracker/leaderboard.md` (the canonical scoreboard — read it before proposing the next experiment).
 
-Current state: **best score still 0.86**. baseline (pretrained adapter, default `Continuer_Nemotron_Notebook.py`) is tied — only by `exp21` (LoRA+). Every other evaluated exp across all three batches regressed; all 27 exp files (Batch-1/2/3) are generated. Target: **0.88+**. Standing guidance in the tracker: single-stage LoRA tweaks are exhausted — pivot to second-stage / data-coverage directions.
+Current state: **best score still 0.86**. baseline (pretrained adapter, default `Continuer_Nemotron_Notebook.py`) is tied by `exp21` (LoRA+) **and now `exp40` (D5 EMA-package), `exp42` (D9 anchored-L2), `exp43` (D10 localized in_proj/out_proj continue-train)** — all 0.86, none exceed. Every other evaluated exp regressed: all of Batch-1/2/3 (27 files), all evaluated Batch-4 data-mixes (exp29–39, best exp35 0.74 ≪ 0.86), **and Batch-5: corpus-editing levers regress (exp47 quality-gate 0.70, exp44 bit-shorten 0.66) while Muon (exp41) 0.78 — only the three non-corpus optimization levers held 0.86**. Target: **0.88+**. **Standing guidance (2026-06-10): single-stage LoRA tweaks, `build_corpus` data-mixes, AND optimizer/regularizer levers are all exhausted (≤0.86); the clean Batch-5 split (non-corpus levers tie 0.86, corpus-edits regress) re-confirms coverage is the binding constraint. Next direction = go back to the ORIGINAL full corpus and add coverage at the source** (regenerate via the `nemotron-master/` pipeline with improved `reasoners/` solvers, esp. Tier-0 `cryptarithm_guess` / `equation_numeric_guess`) — keep the full ~50.5M-token corpus + curated order intact; do NOT continue-train on subset mixes.
 
 ## Research notes (`research/`)
 
@@ -160,19 +168,26 @@ Local file sizes: `corpus.jsonl` = 41 MB, `corpus/` directory = 291 MB.
 
 ### Problem solve status per category
 
+Current LOCAL status — source of truth = [nemotron-master/problems.jsonl](nemotron-master/problems.jsonl)
+(`{id, category, status}`), re-joined 2026-06-10. Totals: rule_found 8,367 / hypothesis_formed 217 /
+rule_unknown 916 (+8,463 augmentation rows with no status). Local solvers are stricter than the
+upstream huikang snapshot, so several rule_found counts are lower than that snapshot's.
+
 | Category | Total | rule_found | hypothesis_formed | rule_unknown |
 |---|---|---|---|---|
-| bit_manipulation | 1,602 | 1,579 | 12 | 11 |
+| bit_manipulation | 1,602 | 1,364 | 121 | 117 |
 | gravity | 1,597 | 1,597 | 0 | 0 |
-| unit_conversion | 1,594 | 1,593 | 0 | 1 |
+| unit_conversion | 1,594 | 1,594 | 0 | 0 |
 | cipher | 1,576 | 1,576 | 0 | 0 |
-| numeral | 1,576 | 1,575 | 0 | 1 |
-| cryptarithm_deduce | 659 | 490 | 58 | 111 |
-| equation_numeric_deduce | 596 | 568 | 27 | 1 |
-| **cryptarithm_guess** | **164** | **0** | **0** | **164** |
-| **equation_numeric_guess** | **136** | **0** | **0** | **136** |
+| numeral | 1,576 | 1,576 | 0 | 0 |
+| cryptarithm_deduce | 659 | 85 | 15 | 559 |
+| equation_numeric_deduce | 596 | 540 | 22 | 34 |
+| **cryptarithm_guess** | **164** | **14** | **24** | **126** |
+| **equation_numeric_guess** | **136** | **21** | **35** | **80** |
 
-`cryptarithm_guess` and `equation_numeric_guess` are **100% unsolved** — no reasoning traces exist for them. Cracking either would unlock the highest-value data expansion.
+`cryptarithm_guess` / `equation_numeric_guess` now have 14 / 21 verified traces (small progress from
+0); `cryptarithm_deduce` only 85 verified (most of its 659 traces are still unverified). These are the
+weakest-coverage categories — but tiny % of the eval (see batch-5 L3 on leverage).
 
 ### Augmentation types (in `augmenters/`)
 

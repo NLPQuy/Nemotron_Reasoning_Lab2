@@ -65,7 +65,7 @@ OP_NAMES = ["add", "abs_diff", "mul", "concat", "rev_concat"]
 # Search budgets (number of recursion nodes). Solvable instances finish well
 # within these; hard/unsolvable instances bail out fast instead of hanging.
 _UNIQUE_BUDGET = 1_500_000
-_NONUNIQUE_BUDGET = 400_000
+_NONUNIQUE_BUDGET = 1_000_000
 
 
 def _num_to_digits(n: int) -> tuple[int, ...]:
@@ -284,20 +284,80 @@ class _Solver:
                 self.answer_info[ans] = (dict(self.mapping), op_info)
 
 
+def _verify_mapping(
+    examples: list[tuple],
+    mapping: dict[str, int],
+    op_info: dict[str, str],
+) -> bool:
+    """Verify that a mapping is consistent with ALL examples."""
+    for ex in examples:
+        s0, s1, op_sym, s3, s4, rsyms = ex
+        # Check all symbols are mapped
+        for s in (s0, s1, s3, s4):
+            if s not in mapping:
+                return False
+        for rs in rsyms:
+            if rs not in mapping:
+                return False
+        lv = mapping[s0] * 10 + mapping[s1]
+        rv = mapping[s3] * 10 + mapping[s4]
+        op_name = op_info.get(op_sym)
+        if op_name is None:
+            continue  # operator not constrained by this example
+        op_id = OP_NAMES.index(op_name)
+        result_val = OPS[op_id](lv, rv)
+        rd = _num_to_digits(result_val) if op_id < 3 else (
+            result_val // 1000,
+            (result_val // 100) % 10,
+            (result_val // 10) % 10,
+            result_val % 10,
+        )
+        if len(rd) != len(rsyms):
+            return False
+        for rs, rdig in zip(rsyms, rd):
+            if mapping.get(rs) != rdig:
+                return False
+    return True
+
+
 def _solve_arith(examples, query):
-    """Return (answer, mapping, op_info) or (None, {}, {})."""
+    """Return (answer, mapping, op_info) or (None, {}, {}).
+
+    Tries unique then non-unique solver on full example set.
+    Falls back to skip-1: drop each example one at a time, solve on N-1,
+    then verify the solution against ALL N examples.
+    """
     arith_examples = [ex for ex in examples if not _is_concat(ex)]
     if not arith_examples:
         return None, {}, {}
 
+    # 1) Try full set, unique
     solver = _Solver(arith_examples, query, unique=True, budget=_UNIQUE_BUDGET)
     ans, (mapping, op_info) = solver.solve()
     if ans is not None:
         return ans, mapping, op_info
 
+    # 2) Try full set, non-unique
     solver2 = _Solver(arith_examples, query, unique=False, budget=_NONUNIQUE_BUDGET)
     ans, (mapping, op_info) = solver2.solve()
-    return (ans, mapping, op_info) if ans is not None else (None, {}, {})
+    if ans is not None:
+        return ans, mapping, op_info
+
+    # 3) Skip-1 fallback: drop each example, solve on N-1, verify on ALL
+    if len(arith_examples) >= 2:
+        for skip_idx in range(len(arith_examples)):
+            subset = arith_examples[:skip_idx] + arith_examples[skip_idx + 1:]
+            s1 = _Solver(subset, query, unique=True, budget=_UNIQUE_BUDGET)
+            a1, (m1, o1) = s1.solve()
+            if a1 is not None and _verify_mapping(arith_examples, m1, o1):
+                return a1, m1, o1
+            s2 = _Solver(subset, query, unique=False, budget=_NONUNIQUE_BUDGET)
+            a2, (m2, o2) = s2.solve()
+            if a2 is not None and _verify_mapping(arith_examples, m2, o2):
+                return a2, m2, o2
+
+    return None, {}, {}
+
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,8 @@ import argparse
 import json
 import math
 from collections import defaultdict
+from collections.abc import Iterable
+from itertools import chain
 from pathlib import Path
 import statistics
 import sys
@@ -52,12 +54,98 @@ def pct(n: int, d: int) -> float:
     return n / d if d else 0.0
 
 
+def looks_like_corpus_row(row: dict) -> bool:
+    return "tokens" in row and "mask" in row and "reward" not in row
+
+
+def measure_corpus(rows: Iterable[dict], output: str | Path) -> None:
+    cat_stats: dict[str, dict] = defaultdict(
+        lambda: {"rows": 0, "tokens": 0, "masked": 0, "unmasked": 0}
+    )
+    total_rows = 0
+    total_tokens = 0
+    total_masked = 0
+    total_unmasked = 0
+
+    for row in rows:
+        tokens = row["tokens"]
+        mask = row["mask"]
+        if len(tokens) != len(mask):
+            raise AssertionError(
+                f"{row.get('problem_id', '')}: len(tokens) != len(mask)"
+            )
+        category = str(row.get("category", "unknown"))
+        unmasked = int(sum(mask))
+        masked = len(mask) - unmasked
+
+        total_rows += 1
+        total_tokens += len(tokens)
+        total_masked += masked
+        total_unmasked += unmasked
+
+        stats = cat_stats[category]
+        stats["rows"] += 1
+        stats["tokens"] += len(tokens)
+        stats["masked"] += masked
+        stats["unmasked"] += unmasked
+
+    report = {
+        "corpus": {
+            "rows": total_rows,
+            "tokens": total_tokens,
+            "masked_tokens": total_masked,
+            "unmasked_tokens": total_unmasked,
+        },
+        "categories": {},
+    }
+    denom = total_unmasked or 1
+    for category, stats in sorted(cat_stats.items()):
+        report["categories"][category] = {
+            **stats,
+            "unmasked_pct": stats["unmasked"] / denom,
+        }
+
+    with Path(output).open("w") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    print(
+        f"Corpus rows={total_rows:,} tokens={total_tokens:,} "
+        f"unmasked={total_unmasked:,} masked={total_masked:,}"
+    )
+    print(f"{'category':28s} {'rows':>6s} {'unmasked':>14s} {'% corpus':>9s}")
+    for category, stats in report["categories"].items():
+        print(
+            f"{category:28s} {stats['rows']:6d} "
+            f"{stats['unmasked']:14,d} {stats['unmasked_pct']:8.1%}"
+        )
+    print(f"Wrote {output}")
+
+
 def main() -> None:
     args = parse_args()
     categories = load_categories(args.problems_jsonl)
 
     by_problem: dict[str, list[dict]] = defaultdict(list)
-    for rec in read_rollouts(args.rollouts):
+    rollout_iter = read_rollouts(args.rollouts)
+    try:
+        first = next(rollout_iter)
+    except StopIteration:
+        first = None
+
+    if first is None:
+        with Path(args.output).open("w") as f:
+            json.dump({"categories": {}, "zero_yield_categories": []}, f)
+            f.write("\n")
+        print(f"No rows in {args.rollouts}")
+        return
+
+    all_rows = chain([first], rollout_iter)
+    if looks_like_corpus_row(first):
+        measure_corpus(all_rows, args.output)
+        return
+
+    for rec in all_rows:
         if args.stage and rec.get("stage") != args.stage:
             continue
         pid = str(rec["problem_id"])

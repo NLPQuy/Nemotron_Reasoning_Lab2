@@ -15,3 +15,10 @@ nemotron-master/training/
 .claude/
 # Batch-3 reference repos (cloned for codex reference; not tracked)
 refs/
+
+# Local generated outputs / Kaggle artifacts.
+corpus/
+kaggle/
+submission/
+rollouts.jsonl
+yield_probe*.json

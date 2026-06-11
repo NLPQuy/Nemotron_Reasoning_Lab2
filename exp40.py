@@ -1,5 +1,9 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP40 START
+# EXP40 — EMA + warmup/cosine-floor + grad-clip + fix grad-accum (Batch-5 D5)
+# Ref: plan-batch-5.md §exp40 | Knob: EMA_DECAY=0.999, warmup=3%, clip=1.0 | Rollback: disable each EXP40_* marker independently
+# >>> EXP40 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +12,26 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
-NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
+# >>> EXP40_CONT START   (continue-train từ 0.86 — luật 1+3 batch-5)
+NUM_EPOCHS = 1.0
+NUM_STEPS = None
+LEARNING_RATE = 1e-5          # <- từ 2e-4; liều nhẹ continue-train
+RESET_WEIGHTS = False         # <- từ True; NẠP adapter 0.86 thay vì fresh init
+SHUFFLE_DATASET = False       # <- giữ curated order (đã là False ở base, giữ nguyên)
+# >>> EXP40_CONT END
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
-SHUFFLE_DATASET = False
+# >>> EXP40_GUARD START
+assert RESET_WEIGHTS is False, "batch-5 phải continue-train từ 0.86"
+assert LEARNING_RATE <= 1e-5, "batch-5 liều nhẹ"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP40_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -653,14 +662,14 @@ def run_training() -> None:
                 weight_sum_t = padded_weights.abs().sum()
                 # >>> EXP_WEIGHT_SIGN END
                 loss_sum_t = weighted_loss.sum()
-                loss = (
-                    loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
-                )
-
-            (loss / n_accum).backward()
+                # >>> EXP40_ACCUM START
+                # Accumulate global loss_sum/weight_sum; backward once at end of batch
+                # (fixes mean-of-means bias in original code)
             total_loss_sum += loss_sum_t.item()
             total_weight_sum += weight_sum_t.item()
-            del loss, per_token_ce, weighted_loss
+            loss_sum_t.backward()  # accumulate raw loss_sum gradients
+                # >>> EXP40_ACCUM END
+            del loss_sum_t, per_token_ce, weighted_loss
 
             t_end = time.time()
             peak_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -680,14 +689,40 @@ def run_training() -> None:
                 eps=1e-8,
                 weight_decay=0.0,
             )
-        lr = LEARNING_RATE * (1 - step / num_steps)
+            # >>> EXP40_EMA START
+            EMA_DECAY = 0.999
+            ema = {n: p.detach().float().clone() for n, p in model.named_parameters() if p.requires_grad}
+            # >>> EXP40_EMA END
+        # >>> EXP40_ACCUM START
+        # Scale accumulated gradients by 1/weight_sum to get correct global mean
+        if total_weight_sum > 0:
+            scale = 1.0 / total_weight_sum
+            for p in model.parameters():
+                if p.requires_grad and p.grad is not None:
+                    p.grad.mul_(scale)
+        # >>> EXP40_ACCUM END
+        # >>> EXP40_WARM START
+        warmup = max(1, int(0.03 * num_steps))
+        if step < warmup:
+            lr = LEARNING_RATE * (step + 1) / warmup
+        else:
+            prog = (step - warmup) / max(1, num_steps - warmup)
+            lr = LEARNING_RATE * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * prog)))  # cosine→10% floor
+        # >>> EXP40_WARM END
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
+        # >>> EXP40_CLIP START
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], max_norm=1e9
-        )
+            [p for p in model.parameters() if p.requires_grad], max_norm=1.0)  # từ 1e9
+        # >>> EXP40_CLIP END
         optimizer.step()
+        # >>> EXP40_EMA START
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in ema:
+                    ema[n].mul_(EMA_DECAY).add_(p.detach().float(), alpha=1-EMA_DECAY)
+        # >>> EXP40_EMA END
         optimizer.zero_grad()
         loss_mean = total_loss_sum / total_weight_sum if total_weight_sum > 0 else 0
         step += 1
@@ -708,6 +743,15 @@ def run_training() -> None:
     for _f in os.listdir(save_dir):
         if _f.startswith("adapter"):
             os.remove(os.path.join(save_dir, _f))
+    # >>> EXP40_EMA START
+    # Ship EMA weights instead of final-step weights
+    print("Shipping EMA weights...")
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in ema:
+                p.copy_(ema[n].to(p.dtype))
+    print("shipped EMA")
+    # >>> EXP40_EMA END
     model.save_pretrained(save_dir)
     st_path = os.path.join(save_dir, "adapter_model.safetensors")
     tensors = load_file(st_path)

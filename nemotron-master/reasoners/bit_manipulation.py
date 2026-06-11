@@ -520,67 +520,36 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
 
     lines: List[str] = []
 
-    # 1) header
-    lines.append(
-        "We need to deduce the transformation by matching the example outputs."
-    )
-    lines.append("I will put my final answer inside \\boxed{}.")
-    lines.append("")
+    # 1) header (compact)
+    lines.append("Deduce transformation. Answer in \\boxed{}.")
 
-    # 2) output examples
+    # 2) output examples (compact: one line per example)
     for i, out in enumerate(outputs):
-        lines.append(f"Output {i}: {out}")
-        for bit in range(N_BITS):
-            lines.append(f"{bit} {out[bit]}")
-        lines.append("")
-
+        lines.append(f"O{i}:{out}")
     # 3) output bit columns
-    lines.append("Output bit columns (with bitsum as hash)")
+    lines.append("OBC")
     for bit in range(N_BITS):
         lines.append(
             f"{bit} {output_columns[bit]} {_column_hash(output_columns[bit], n_examples)}"
         )
-
-    # 4) input examples
-    lines.append("")
+    # 4) input examples (compact)
     for i, inp in enumerate(inputs):
-        lines.append(f"Input {i}: {inp}")
-        for bit in range(N_BITS):
-            lines.append(f"{bit} {inp[bit]}")
-        lines.append("")
+        lines.append(f"I{i}:{inp}")
 
-    # 5) Operation sections (raw data + matching + LRM)
-    lines.append("When matching output")
-    lines.append("x: not in operator")
-    lines.append("y: wrong position")
-    lines.append("")
+    # 5) Operation sections
     section_lefts: list[tuple[str, str]] = []  # (name, left_best)
     section_rights: list[tuple[str, str]] = []  # (name, right_best)
 
     def _add_section(name: str) -> None:
         records = all_records[name]
         per_bit = all_matches[name]
-        # Raw data
         lines.append(name)
-        prev_diff = None
         for rec in records:
-            # Insert blank line between diff groups for pair operations
-            if (
-                len(rec.label) >= 2
-                and rec.label[0].isdigit()
-                and rec.label[1].isdigit()
-            ):
-                diff = (int(rec.label[1]) - int(rec.label[0])) % N_BITS
-                if prev_diff is not None and diff != prev_diff:
-                    lines.append("")
-                prev_diff = diff
             line = f"{rec.label} {rec.col} {rec.hash_}"
             if rec.matches:
-                line += " match " + " ".join(str(i) for i in rec.matches)
+                line += " m " + " ".join(str(i) for i in rec.matches)
             lines.append(line)
-        lines.append("")
-        # Matching: per output bit, which candidates match
-        lines.append("Matching output")
+        lines.append("MO")
         for i in range(N_BITS):
             cands = per_bit[i]
             if cands:
@@ -594,30 +563,25 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
 
                 lines.append(f"{i} " + " ".join(_compact(c) for c in cands))
             else:
-                lines.append(f"{i} absent")
-        lines.append("")
+                lines.append(f"{i} -")
         left_lines, left_best, right_lines, right_best = _lr_from_matches(per_bit)
         section_lefts.append((name, left_best))
         section_rights.append((name, right_best))
-        lines.append("Left")
+        lines.append("L")
         for ll in left_lines:
             lines.append(ll)
-        lines.append(f"Best: {left_best}")
-        lines.append("")
-        lines.append("Right")
+        lines.append(f"B:{left_best}")
+        lines.append("R")
         for rl in right_lines:
             lines.append(rl)
-        lines.append(f"Best: {right_best}")
-        lines.append("")
+        lines.append(f"B:{right_best}")
 
     for name in all_records:
         _add_section(name)
 
     # 7) Selecting rule block.
-    lines.append("Selecting")
-    lines.append("")
+    lines.append("Sel")
 
-    # Pick winners from per-section analysis
     def _parse_count(val: str) -> int:
         if val == "none":
             return 0
@@ -645,7 +609,6 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
         section_rights
     )
 
-    # Get the actual left/right runs from per-section matches
     def _get_section_run(
         winner_name: Optional[str], direction: str
     ) -> List[RuleCandidate]:
@@ -664,41 +627,20 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
     left_run = _get_section_run(left_winner_name, "left")
     right_run = _get_section_run(right_winner_name, "right")
 
-    lines.append("Lefts")
+    lines.append("Ls")
     for name, lb in section_lefts:
         lines.append(f"{name} {lb}")
-    lines.append("")
-    lines.append("Rights")
+    lines.append("Rs")
     for name, rb in section_rights:
         lines.append(f"{name} {rb}")
-    lines.append("")
-    lines.append(f"Left longest: {left_winner_count}")
-    lines.append(f"Right longest: {right_winner_count}")
-    lines.append("")
-
-    def _matching_line(
-        label: str,
-        winner_name: Optional[str],
-        entries: list[tuple[str, str]],
-    ) -> str:
-        parts = []
-        for name, _val in entries:
-            parts.append(f"{name} {'yes' if name == winner_name else 'no'}")
-        return f"{label} winner: {', '.join(parts)}"
+    lines.append(f"Ll:{left_winner_count} Rl:{right_winner_count}")
 
     if right_winner_count > left_winner_count:
-        lines.append(_matching_line("Right", right_winner_name, section_rights))
-        lines.append(_matching_line("Left", left_winner_name, section_lefts))
-        lines.append("")
-        lines.append(f"Best right: {right_winner_text}")
-        lines.append(f"Best left: {left_winner_text}")
+        lines.append(f"Bst R:{right_winner_text}")
+        lines.append(f"Bst L:{left_winner_text}")
     else:
-        lines.append(_matching_line("Left", left_winner_name, section_lefts))
-        lines.append(_matching_line("Right", right_winner_name, section_rights))
-        lines.append("")
-        lines.append(f"Best left: {left_winner_text}")
-        lines.append(f"Best right: {right_winner_text}")
-    lines.append("")
+        lines.append(f"Bst L:{left_winner_text}")
+        lines.append(f"Bst R:{right_winner_text}")
 
     # Truncate if left + right > N_BITS: shorten the shorter one
     left_len_final = left_winner_count
@@ -712,37 +654,34 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
             right_run = right_run[-right_len_final:] if right_len_final else []
     left_was_truncated = left_len_final < left_winner_count
     right_was_truncated = right_len_final < right_winner_count
-    trunc_left = f"Truncated left: {_format_list(left_run, with_count=True)}"
+    trunc_left = f"TL:{_format_list(left_run, with_count=True)}"
     if left_was_truncated:
-        trunc_left += " truncated"
-    trunc_right = f"Truncated right: {_format_list(list(reversed(right_run)), with_count=True)}"
+        trunc_left += " t"
+    trunc_right = f"TR:{_format_list(list(reversed(right_run)), with_count=True)}"
     if right_was_truncated:
-        trunc_right += " truncated"
+        trunc_right += " t"
     if right_winner_count > left_winner_count:
         lines.append(trunc_right)
         lines.append(trunc_left)
     else:
         lines.append(trunc_left)
         lines.append(trunc_right)
-    lines.append("")
 
     right_start_final = N_BITS - right_len_final
-    lines.append("Tentative from right")
+    lines.append("TfR")
     for i in range(N_BITS - 1, -1, -1):
         if i >= right_start_final and right_run:
             lines.append(f"{i} {right_run[i - right_start_final].expr}")
         else:
-            lines.append(f"{i} pending")
-    lines.append("")
-    lines.append("Tentative")
+            lines.append(f"{i} p")
+    lines.append("T")
     for i in range(N_BITS):
         if i < left_len_final:
             lines.append(f"{i} {left_run[i].expr}")
         elif i >= right_start_final and right_run:
             lines.append(f"{i} {right_run[i - right_start_final].expr}")
         else:
-            lines.append(f"{i} pending")
-    lines.append("")
+            lines.append(f"{i} p")
 
     # Preferred: extrapolate left/right strides into pending slots
     def _extrap_from(
@@ -803,12 +742,10 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
             else:
                 preferred.append("pending")
 
-        lines.append("Preferred from right")
+        lines.append("PfR")
         for i in range(N_BITS - 1, -1, -1):
             lines.append(f"{i} {preferred[i]}")
-        lines.append("")
 
-        # Fill remaining pending from left; merge unary digits
         for i in range(N_BITS):
             if preferred[i] == "pending":
                 if left_is_binary or left_is_unary:
@@ -818,7 +755,6 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
             elif "?" in preferred[i][1:] and left_is_unary:
                 el = _extrap_from(left_run, i, 0, "left")
                 if el:
-                    # Merge: fill unknown slots
                     merged = list(preferred[i])
                     el_chars = list(el)
                     for j in range(1, min(len(merged), len(el_chars))):
@@ -826,10 +762,9 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
                             merged[j] = el_chars[j]
                     preferred[i] = "".join(merged)
 
-        lines.append("Preferred from left")
+        lines.append("PfL")
         for i in range(N_BITS):
             lines.append(f"{i} {preferred[i]}")
-        lines.append("")
     else:
         # Left is longer or equal: extrapolate from left first
         preferred = []
@@ -845,12 +780,10 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
             else:
                 preferred.append("pending")
 
-        lines.append("Preferred from left")
+        lines.append("PfL")
         for i in range(N_BITS):
             lines.append(f"{i} {preferred[i]}")
-        lines.append("")
 
-        # Fill remaining pending from right; merge unary digits
         for i in range(N_BITS):
             if preferred[i] == "pending":
                 if right_is_binary or right_is_unary:
@@ -860,7 +793,6 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
             elif "?" in preferred[i][1:] and right_is_unary:
                 er = _extrap_from(right_run, i, right_start_final, "right")
                 if er:
-                    # Merge: fill unknown slots
                     merged = list(preferred[i])
                     er_chars = list(er)
                     for j in range(1, min(len(merged), len(er_chars))):
@@ -868,18 +800,16 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
                             merged[j] = er_chars[j]
                     preferred[i] = "".join(merged)
 
-        lines.append("Preferred from right")
+        lines.append("PfR")
         for i in range(N_BITS - 1, -1, -1):
             lines.append(f"{i} {preferred[i]}")
-        lines.append("")
 
-    lines.append("Preferred")
+    lines.append("Pf")
     for i, pref in enumerate(preferred):
         if pref.startswith("?") and len(pref) == 3 and pref[1] != "?" and pref[2] != "?":
             lines.append(f"{i} {pref} ?{pref[2]}{pref[1]}")
         else:
             lines.append(f"{i} {pref}")
-    lines.append("")
 
     # Build the final vector: left + middle selection + right
     default_cand = RuleCandidate(DEFAULT_FAMILY, None, None, "default 1")
@@ -892,7 +822,7 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
         best[right_start_final + i] = rc
 
     # Fill middle (pending) slots via Matching + Perfect match logic
-    lines.append("Matching")
+    lines.append("Mt")
     pending_indices: list[int] = []
     per_bit_cat: dict[str, dict[int, list[RuleCandidate]]] = {
         name: {} for name in SECTION_ORDER
@@ -917,16 +847,15 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
                     checks.append(section_name + " " + " ".join(c.expr for c in found))
                     per_bit_cat[section_name][i] = found
                 else:
-                    checks.append(f"{section_name} absent")
+                    checks.append(f"{section_name} -")
             elif section_name == "Constant":
                 if cands:
-                    checks.append("Constant " + " ".join(c.expr for c in cands))
+                    checks.append("C " + " ".join(c.expr for c in cands))
                     per_bit_cat["Constant"][i] = list(cands)
                 else:
-                    checks.append("Constant absent")
+                    checks.append("C -")
             else:
                 found_c: Optional[RuleCandidate] = None
-                # Try both orderings; prefer the first (as shown in Preferred)
                 orderings = []
                 want_p = int(pref[1]) if len(pref) > 1 and pref[1] != "?" else None
                 want_s = int(pref[2]) if len(pref) > 2 and pref[2] != "?" else None
@@ -944,16 +873,15 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
                     checks.append(found_c.expr)
                     per_bit_cat[section_name][i] = [found_c]
                 else:
-                    checks.append(f"{section_name} absent")
+                    checks.append(f"{section_name} -")
         if pref.startswith("?") and len(pref) == 3 and pref[1] != "?" and pref[2] != "?":
             pref_display = f"{pref} ?{pref[2]}{pref[1]}"
         else:
             pref_display = pref
         lines.append(f"{i} {pref_display} - {', '.join(checks)}")
-    lines.append("")
 
     # Perfect match: first category that covers ALL pending bits wins
-    lines.append("Perfect match")
+    lines.append("PM")
     chosen_cat: Optional[str] = None
     for cat in SECTION_ORDER:
         is_perfect = (
@@ -961,21 +889,19 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
             and bool(pending_indices)
             and all(i in per_bit_cat[cat] for i in pending_indices)
         )
-        lines.append(f"{cat} {'yes' if is_perfect else 'no'}")
+        lines.append(f"{cat} {'y' if is_perfect else 'n'}")
         if is_perfect:
             chosen_cat = cat
-    lines.append("")
 
     # Matched: use perfect-match category to fill pending slots
     pending_set = set(pending_indices)
-    lines.append("Matched")
+    lines.append("Md")
     for i in range(N_BITS):
         if i in pending_set:
             if chosen_cat and i in per_bit_cat[chosen_cat]:
                 best[i] = per_bit_cat[chosen_cat][i][0]
                 lines.append(f"{i} {best[i].expr}")
             else:
-                # No perfect match — list all candidates for this slot
                 all_cands: list[RuleCandidate] = []
                 for name in SECTION_ORDER:
                     if i in per_bit_cat[name]:
@@ -984,22 +910,19 @@ def reasoning_bit_manipulation(problem: Problem) -> Optional[str]:
                     lines.append(f"{i} " + " ".join(c.expr for c in all_cands))
                     best[i] = all_cands[0]
                 else:
-                    lines.append(f"{i} none")
+                    lines.append(f"{i} -")
                     best[i] = default_cand
         else:
             lines.append(f"{i} {best[i].expr}")
-    lines.append("")
 
     # Check if we have any non-default rules
     if all(r.is_default for r in best):
         return None
 
-    lines.append("Selected")
+    lines.append("S")
     for i, rule in enumerate(best):
         lines.append(f"{i} {rule.expr}")
 
-    # 8) Apply to question.
-    lines.append("")
     _emit_apply(lines, question_bits, best)
 
     return "\n".join(lines)

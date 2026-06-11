@@ -1,5 +1,12 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP50 START
+# EXP50 — Partial-LoRA on SSM-slice of in_proj (Batch-6 B6-11), Mamba-2 layout.
+# Ref: refs/mambapeft mamba_peft.py:404-431 (zero-pad B outside slice). Nemotron-H in_proj out-dim order
+# (modeling_nemotron_h split [intermediate, conv_dim, num_heads] -> [gate|x|B|C|dt]); SSM slice [B|C|dt]
+# = rows [2*intermediate_size, end). Knob: PARTIAL_SSM_SLICE=True | Rollback: PARTIAL_SSM_SLICE=False
+# Deploy: chỉ ép một số HÀNG của lora_B = 0 -> vẫn lora_A/B rank-32 chuẩn.
+# >>> EXP50 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +15,27 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
+# >>> EXP_3EPOCH START — from-scratch: 3 full passes (see EXP_MULTIEPOCH in training loop)
+NUM_EPOCHS = 3.0  # train this many full passes over the corpus (auto-sized)
+# >>> EXP_3EPOCH END
 NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
+# >>> EXP50_CONT START   (FROM-SCRATCH — train fresh, không nạp 0.86)
+LEARNING_RATE = 2e-4          # recipe from-scratch gốc (đổi về 1e-5 nếu muốn continue)
+RESET_WEIGHTS = True          # <- True: fresh init; B=0 + grad-mask ⇒ delta in_proj CHỈ ở slice SSM (sạch)
+# >>> EXP50_CONT END
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+# >>> EXP50_GUARD START
+assert RESET_WEIGHTS is True, "exp50 = from-scratch (partial-SSM sạch: B=0 ngoài slice)"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP50_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -539,6 +552,44 @@ def run_training() -> None:
         def _tie_grads() -> None:
             pass
 
+    # >>> EXP50 START — B6-11 Partial-LoRA SSM-slice of in_proj (Mamba-2).
+    # in_proj out-dim order [gate(I) | x(I) | B(G) | C(G) | dt(H)], I=intermediate_size.
+    # SSM-recurrence rows [B|C|dt] = [2*I, end). Keep new learning in that slice.
+    PARTIAL_SSM_SLICE = True
+    PARTIAL_ZERO_INIT = False  # from-scratch: B init=0 everywhere, grad-mask keeps gate|x rows at 0
+                               # forever ⇒ delta in_proj lives ONLY in the SSM slice. Init-zero not needed.
+    _mcfg = None
+    _scan = model
+    while hasattr(_scan, "model"):
+        _scan = _scan.model
+    _mcfg = _scan.config
+    assert hasattr(_mcfg, "mamba_num_heads"), "EXP50: config missing mamba_num_heads"
+    assert hasattr(_mcfg, "mamba_head_dim"), "EXP50: config missing mamba_head_dim"
+    _I = _mcfg.mamba_num_heads * _mcfg.mamba_head_dim
+    _partial_lo = 2 * _I
+    _partial_inproj = [
+        _m for _nm, _m in model.named_modules()
+        if _nm.endswith("in_proj") and hasattr(_m, "lora_B")
+        and "default" in getattr(_m, "lora_A", {})
+    ]
+
+    def _partial_zero_B(grad: bool) -> None:
+        if not PARTIAL_SSM_SLICE:
+            return
+        with torch.no_grad():
+            for _m in _partial_inproj:
+                Bw = _m.lora_B["default"].weight
+                tgt = Bw.grad if grad else Bw.data
+                if tgt is None:
+                    continue
+                tgt[:_partial_lo].zero_()  # zero rows before SSM slice (gate|x)
+
+    print(f"EXP50 Partial-SSM: {len(_partial_inproj)} in_proj LoRA modules, slice rows >= {_partial_lo}")
+    if PARTIAL_ZERO_INIT:
+        _partial_zero_B(grad=False)
+        print("EXP50: zeroed gate|x rows of in_proj lora_B at init (PARTIAL_ZERO_INIT=True)")
+    # >>> EXP50 END
+
     # ── Training loop ────────────────────────────────────────────────
     gc.collect()
     torch.cuda.empty_cache()
@@ -567,13 +618,11 @@ def run_training() -> None:
     num_steps = max(1, round(NUM_EPOCHS * max_steps))
     if NUM_STEPS is not None:
         num_steps = min(num_steps, NUM_STEPS)
-    if num_steps > max_steps:
-        _log(
-            f"WARNING: requested {num_steps} steps exceeds single-pass "
-            f"max_steps={max_steps} ({len(examples)} // {BATCH_SIZE}). "
-            f"Clamping to {max_steps}."
-        )
-        num_steps = max_steps
+    # >>> EXP_MULTIEPOCH START — allow up to NUM_EPOCHS passes (no single-pass clamp)
+    _total_avail = max_steps * math.ceil(NUM_EPOCHS)
+    if num_steps > _total_avail:
+        num_steps = _total_avail
+    # >>> EXP_MULTIEPOCH END
     _log(
         f"Auto steps: NUM_EPOCHS={NUM_EPOCHS}, steps/epoch={max_steps}, "
         f"num_steps={num_steps}, NUM_STEPS_cap={NUM_STEPS}"
@@ -586,7 +635,10 @@ def run_training() -> None:
     )
 
     step = 0
-    for batch_start in range(0, len(indices), BATCH_SIZE):
+    # >>> EXP_MULTIEPOCH START — repeat curated order NUM_EPOCHS times (keeps order, no shuffle)
+    _epoch_indices = indices * math.ceil(NUM_EPOCHS)
+    # >>> EXP_MULTIEPOCH END
+    for batch_start in range(0, len(_epoch_indices), BATCH_SIZE):
         if step >= num_steps:
             break
         # >>> EXP_TIME_GUARD START
@@ -597,7 +649,7 @@ def run_training() -> None:
             )
             break
         # >>> EXP_TIME_GUARD END
-        batch_indices = indices[batch_start : batch_start + BATCH_SIZE]
+        batch_indices = _epoch_indices[batch_start : batch_start + BATCH_SIZE]
         batch = [examples[i] for i in batch_indices]
         batch_tokens = [e["tokens"] for e in batch]
         batch_targets = [e["targets"] for e in batch]
@@ -653,14 +705,12 @@ def run_training() -> None:
                 weight_sum_t = padded_weights.abs().sum()
                 # >>> EXP_WEIGHT_SIGN END
                 loss_sum_t = weighted_loss.sum()
-                loss = (
-                    loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
-                )
-
-            (loss / n_accum).backward()
+            # >>> D5_ACCUM START — backward raw loss_sum; scale grads by 1/total_weight after batch (fix mean-of-means)
             total_loss_sum += loss_sum_t.item()
             total_weight_sum += weight_sum_t.item()
-            del loss, per_token_ce, weighted_loss
+            loss_sum_t.backward()
+            # >>> D5_ACCUM END
+            del loss_sum_t, per_token_ce, weighted_loss
 
             t_end = time.time()
             peak_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -680,14 +730,43 @@ def run_training() -> None:
                 eps=1e-8,
                 weight_decay=0.0,
             )
-        lr = LEARNING_RATE * (1 - step / num_steps)
+            # >>> D5_EMA START — init EMA shadow of trainable params
+            EMA_DECAY = 0.999
+            ema = {n: p.detach().float().clone() for n, p in model.named_parameters() if p.requires_grad}
+            # >>> D5_EMA END
+        # >>> D5_ACCUM START — scale accumulated grads by 1/total_weight (global mean)
+        if total_weight_sum > 0:
+            _scale = 1.0 / total_weight_sum
+            for _p in model.parameters():
+                if _p.requires_grad and _p.grad is not None:
+                    _p.grad.mul_(_scale)
+        # >>> D5_ACCUM END
+        # >>> D5_WARM START — 3% warmup + cosine→10% floor
+        _warmup = max(1, int(0.03 * num_steps))
+        if step < _warmup:
+            lr = LEARNING_RATE * (step + 1) / _warmup
+        else:
+            _prog = (step - _warmup) / max(1, num_steps - _warmup)
+            lr = LEARNING_RATE * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * _prog)))
+        # >>> D5_WARM END
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
+        # >>> EXP50 grad-mask: zero in_proj lora_B grads outside SSM slice
+        _partial_zero_B(grad=True)
+        # >>> EXP50 grad-mask END
+        # >>> D5_CLIP START — max_norm 1e9 → 1.0
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], max_norm=1e9
+            [p for p in model.parameters() if p.requires_grad], max_norm=1.0
         )
+        # >>> D5_CLIP END
         optimizer.step()
+        # >>> D5_EMA START — update EMA after optimizer step
+        with torch.no_grad():
+            for _n, _p in model.named_parameters():
+                if _p.requires_grad and _n in ema:
+                    ema[_n].mul_(EMA_DECAY).add_(_p.detach().float(), alpha=1 - EMA_DECAY)
+        # >>> D5_EMA END
         optimizer.zero_grad()
         loss_mean = total_loss_sum / total_weight_sum if total_weight_sum > 0 else 0
         step += 1
@@ -708,6 +787,13 @@ def run_training() -> None:
     for _f in os.listdir(save_dir):
         if _f.startswith("adapter"):
             os.remove(os.path.join(save_dir, _f))
+    # >>> D5_EMA START — ship EMA weights instead of last-step weights
+    print("Shipping EMA weights...")
+    with torch.no_grad():
+        for _n, _p in model.named_parameters():
+            if _p.requires_grad and _n in ema:
+                _p.copy_(ema[_n].to(_p.dtype))
+    # >>> D5_EMA END
     model.save_pretrained(save_dir)
     st_path = os.path.join(save_dir, "adapter_model.safetensors")
     tensors = load_file(st_path)

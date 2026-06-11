@@ -28,6 +28,15 @@ PROTECT_PATTERNS = [
 
 _COMPRESSOR = None
 _COMPRESSOR_MODEL = DEFAULT_COMPRESSOR_MODEL
+_COMPRESSOR_DEVICE = "cpu"
+
+
+def default_compressor_device() -> str:
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,8 +52,10 @@ def parse_args() -> argparse.Namespace:
         "--tokenizer_json_path", default=str(NEMOTRON_ROOT / "tokenizer.json")
     )
     p.add_argument("--compressor_model", default=DEFAULT_COMPRESSOR_MODEL)
+    p.add_argument("--compressor_device", default=default_compressor_device())
     p.add_argument("--ratios", default="0.7,0.6,0.5")
     p.add_argument("--max_problems", type=int, default=0)
+    p.add_argument("--progress_every", type=int, default=10)
     return p.parse_args()
 
 
@@ -76,7 +87,7 @@ def get_compressor():
             ) from exc
         _COMPRESSOR = PromptCompressor(
             model_name=_COMPRESSOR_MODEL,
-            device_map="cpu",
+            device_map=_COMPRESSOR_DEVICE,
             use_llmlingua2=True,
         )
     return _COMPRESSOR
@@ -126,8 +137,9 @@ def compress_text(text: str, ratio: float, protect_patterns: list[Pattern[str]])
 
 def main() -> None:
     args = parse_args()
-    global _COMPRESSOR_MODEL
+    global _COMPRESSOR_DEVICE, _COMPRESSOR_MODEL
     _COMPRESSOR_MODEL = args.compressor_model
+    _COMPRESSOR_DEVICE = args.compressor_device
 
     ratios = [float(r.strip()) for r in args.ratios.split(",") if r.strip()]
     if any(r < 0.5 for r in ratios):
@@ -148,12 +160,23 @@ def main() -> None:
     out_rows = []
     kept = 0
     dropped = 0
-    for problem in problems:
+    total = len(problems)
+    print(
+        f"compress_traces: total={total} device={args.compressor_device} "
+        f"ratios={','.join(str(r) for r in ratios)}",
+        flush=True,
+    )
+    for index, problem in enumerate(problems, start=1):
         pid = str(problem["id"])
         train_row = train_rows.get(pid)
         reasoning_path = reasoning_dir / f"{pid}.txt"
         if train_row is None or not reasoning_path.exists():
             dropped += 1
+            if args.progress_every and index % args.progress_every == 0:
+                print(
+                    f"progress {index}/{total} kept={kept} dropped={dropped}",
+                    flush=True,
+                )
             continue
 
         answer = train_row["answer"]
@@ -169,6 +192,11 @@ def main() -> None:
 
         if not compressed:
             dropped += 1
+            if args.progress_every and index % args.progress_every == 0:
+                print(
+                    f"progress {index}/{total} kept={kept} dropped={dropped}",
+                    flush=True,
+                )
             continue
 
         out_rows.append(
@@ -185,6 +213,11 @@ def main() -> None:
             )
         )
         kept += 1
+        if args.progress_every and index % args.progress_every == 0:
+            print(
+                f"progress {index}/{total} kept={kept} dropped={dropped}",
+                flush=True,
+            )
 
     write_rows(args.output, out_rows)
     print(f"kept={kept} dropped={dropped} output={args.output}")

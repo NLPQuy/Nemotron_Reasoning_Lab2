@@ -1,5 +1,9 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP44 START
+# EXP44 — Bit-shorten corpus + anchored-L2 (Batch-5 D1 + D9)
+# Ref: plan-batch-5.md §D1/exp44 | Knob: ANCHOR_LAMBDA=1e-3 | Rollback: revert corpus to baseline
+# >>> EXP44 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +12,26 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
-NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
+# >>> EXP44_CONT START   (continue-train từ 0.86 — luật 1+3 batch-5)
+NUM_EPOCHS = 1.0
+NUM_STEPS = None
+LEARNING_RATE = 1e-5          # <- từ 2e-4; liều nhẹ continue-train
+RESET_WEIGHTS = False         # <- từ True; NẠP adapter 0.86 thay vì fresh init
+SHUFFLE_DATASET = False       # <- giữ curated order
+# >>> EXP44_CONT END
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
-SHUFFLE_DATASET = False
+# >>> EXP44_GUARD START
+assert RESET_WEIGHTS is False, "batch-5 phải continue-train từ 0.86"
+assert LEARNING_RATE <= 1e-5, "batch-5 liều nhẹ"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP44_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -112,8 +121,10 @@ def run_training() -> None:
     if IS_KAGGLE:
         import kagglehub
 
-        CORPUS_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/tokens"
-        TRAIN_ORDER_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/logprobs/index.jsonl"
+        # >>> EXP44_CORPUS START  (D1: bitshort variant — uses JSONL reader)
+        CORPUS_PATH = "/kaggle/input/datasets/ngoczhu/nemotron-corpus-bitshort/corpus_bitshort.jsonl"
+        # >>> EXP44_CORPUS END
+        TRAIN_ORDER_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/logprobs/index.jsonl"  # unused when JSONL
         TRAIN_CSV_PATH = "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge/train.csv"
         # >>> KAGGLE_ADAPTER START
         # 0.86 adapter as loose Kaggle dataset (no unzip). ADAPTER_SRC is read-only
@@ -277,6 +288,19 @@ def run_training() -> None:
         f"Loaded {len(examples)} examples, {total_tokens:,} tokens "
         f"(unmasked={total_unmasked:,.0f})"
     )
+
+    # >>> EXP44_FULLSIZE_GUARD START
+    # Chống lỗi batch-4 (train nhầm SUBSET). corpus_bitshort = FULL (~17963 dòng / ~49.3M token).
+    if IS_KAGGLE:
+        _exp_rows, _exp_tok = 17963, 49_270_000
+        assert abs(len(examples) - _exp_rows) <= 0.05 * _exp_rows, (
+            f"FULL-SIZE GUARD: {len(examples)} dòng lệch >5% so với {_exp_rows} — corpus là SUBSET?"
+        )
+        assert total_tokens >= 0.90 * _exp_tok, (
+            f"FULL-SIZE GUARD: {total_tokens:,} token < 90% của {_exp_tok:,} — corpus thiếu"
+        )
+        print(f"FULL-SIZE GUARD ok: {len(examples)} dòng / {total_tokens:,} token")
+    # >>> EXP44_FULLSIZE_GUARD END
 
     # ── Load base model ──────────────────────────────────────────────
     gc.collect()
@@ -469,6 +493,12 @@ def run_training() -> None:
             f"Not all adapter weights loaded: {loaded}/{len(adapter_weights)}"
         )
         print(f"  Loaded {loaded}/{len(adapter_weights)} weights into model")
+
+    # >>> EXP44 START  (anchor from EXP42)
+    ANCHOR_LAMBDA = 1e-3
+    theta_ref = {n: p.detach().float().clone() for n, p in model.named_parameters() if p.requires_grad}
+    print(f"EXP44: snapshot theta_ref ({len(theta_ref)} params, ANCHOR_LAMBDA={ANCHOR_LAMBDA})")
+    # >>> EXP44 END
 
     # ── Freeze all LoRA params except in_proj (if IN_PROJ_ONLY) ──
     print(f"{IN_PROJ_ONLY=}")
@@ -684,6 +714,12 @@ def run_training() -> None:
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
+        # >>> EXP44 START  (anchor gradient from EXP42)
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.requires_grad and p.grad is not None and n in theta_ref:
+                    p.grad.add_(ANCHOR_LAMBDA * (p.detach().float() - theta_ref[n]).to(p.grad.dtype))
+        # >>> EXP44 END
         grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], max_norm=1e9
         )

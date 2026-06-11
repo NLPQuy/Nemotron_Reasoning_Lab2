@@ -1,5 +1,9 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP41 START
+# EXP41 — Muon optimizer for LoRA 2D + AuxAdam for rest (Batch-5 D11)
+# Ref: refs/muon/muon.py (INLINED) | Knob: MUON_LR=0.5e-3 | Rollback: set back to AdamW gốc at L675-682
+# >>> EXP41 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +12,29 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
-NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
+# >>> EXP41_CONT START   (continue-train từ 0.86 — luật 1+3 batch-5)
+NUM_EPOCHS = 1.0
+NUM_STEPS = None
+LEARNING_RATE = 1e-5          # <- từ 2e-4; liều nhẹ continue-train (Adam group)
+RESET_WEIGHTS = False         # <- từ True; NẠP adapter 0.86 thay vì fresh init
+SHUFFLE_DATASET = False       # <- giữ curated order
+# >>> EXP41_CONT END
+# >>> EXP41 START
+MUON_LR = 0.5e-3              # Muon LR in spectral-norm units (NOT 1e-5)
+# >>> EXP41 END
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
-SHUFFLE_DATASET = False
+# >>> EXP41_GUARD START
+assert RESET_WEIGHTS is False, "batch-5 phải continue-train từ 0.86"
+assert LEARNING_RATE <= 1e-5, "batch-5 liều nhẹ"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP41_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -107,6 +119,91 @@ def run_training() -> None:
     from cut_cross_entropy import linear_cross_entropy
     from peft import LoraConfig
     from peft.tuners.lora import Linear as LoraLinear
+
+    # >>> EXP41 START — INLINED Muon optimizer (from refs/muon/muon.py)
+    def zeropower_via_newtonschulz5(G, steps: int):
+        """
+        Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+        """
+        assert G.ndim >= 2
+        a, b, c = (3.4445, -4.7750,  2.0315)
+        X = G.bfloat16()
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        return X
+
+    def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+        momentum.lerp_(grad, 1 - beta)
+        update = grad.lerp_(momentum, beta) if nesterov else momentum
+        if update.ndim == 4:
+            update = update.view(len(update), -1)
+        update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+        update *= max(1, update.size(-2) / update.size(-1))**0.5
+        return update
+
+    def adam_update(grad, buf1, buf2, step, betas, eps):
+        buf1.lerp_(grad, 1 - betas[0])
+        buf2.lerp_(grad.square(), 1 - betas[1])
+        buf1c = buf1 / (1 - betas[0]**step)
+        buf2c = buf2 / (1 - betas[1]**step)
+        return buf1c / (buf2c.sqrt() + eps)
+
+    class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
+        """Non-distributed Muon + AuxAdam."""
+        def __init__(self, param_groups):
+            for group in param_groups:
+                assert "use_muon" in group
+                if group["use_muon"]:
+                    group["lr"] = group.get("lr", 0.02)
+                    group["momentum"] = group.get("momentum", 0.95)
+                    group["weight_decay"] = group.get("weight_decay", 0)
+                else:
+                    group["lr"] = group.get("lr", 3e-4)
+                    group["betas"] = group.get("betas", (0.9, 0.95))
+                    group["eps"] = group.get("eps", 1e-10)
+                    group["weight_decay"] = group.get("weight_decay", 0)
+            super().__init__(param_groups, dict())
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for group in self.param_groups:
+                if group["use_muon"]:
+                    for p in group["params"]:
+                        if p.grad is None:
+                            continue
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                        update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                else:
+                    for p in group["params"]:
+                        if p.grad is None:
+                            continue
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["exp_avg"] = torch.zeros_like(p)
+                            state["exp_avg_sq"] = torch.zeros_like(p)
+                            state["step"] = 0
+                        state["step"] += 1
+                        update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
+                                             state["step"], group["betas"], group["eps"])
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update, alpha=-group["lr"])
+            return loss
+    # >>> EXP41 END — INLINED Muon optimizer
 
     # ── Env-specific paths + adapter source ──────────────────────────
     if IS_KAGGLE:
@@ -672,17 +769,26 @@ def run_training() -> None:
                 f"peak={peak_gb:.1f}GB, mem={mem_gb:.1f}GB"
             )
 
+        # >>> EXP41 START
         if optimizer is None:
-            optimizer = torch.optim.AdamW(
-                [p for p in model.parameters() if p.requires_grad],
-                lr=LEARNING_RATE,
-                betas=(0.9, 0.95),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-        lr = LEARNING_RATE * (1 - step / num_steps)
+            muon_params, adam_params = [], []
+            for n, p in model.named_parameters():
+                if not p.requires_grad: continue
+                is_lora2d = (".lora_" in n) and (".experts." not in n) and p.ndim == 2  # LoRA 2D sạch
+                (muon_params if is_lora2d else adam_params).append(p)   # expert-LoRA + router/bias → Adam
+            optimizer = SingleDeviceMuonWithAuxAdam([
+                dict(params=muon_params, lr=MUON_LR, momentum=0.95, weight_decay=0.0, use_muon=True),
+                dict(params=adam_params, lr=LEARNING_RATE, betas=(0.9,0.95), eps=1e-8, weight_decay=0.0, use_muon=False),
+            ])
+            _log(f"EXP41 Muon: {len(muon_params)} muon params, {len(adam_params)} adam params")
+        lr_frac = (1 - step / num_steps)
         for pg in optimizer.param_groups:
-            pg["lr"] = lr
+            if pg["use_muon"]:
+                pg["lr"] = MUON_LR * lr_frac
+            else:
+                pg["lr"] = LEARNING_RATE * lr_frac
+        lr = MUON_LR * lr_frac  # for the step log line below (Muon group LR)
+        # >>> EXP41 END
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
         grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], max_norm=1e9

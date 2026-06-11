@@ -1,5 +1,9 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP43 START
+# EXP43 — Continue-train localized to specific modules (Batch-5 D10)
+# Ref: Continuer IN_PROJ_ONLY mechanism | Knob: TRAIN_ONLY_MODULES=("in_proj","out_proj") | Rollback: TRAIN_ONLY_MODULES=()
+# >>> EXP43 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +12,26 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
-NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
+# >>> EXP43_CONT START   (continue-train từ 0.86 — luật 1+3 batch-5)
+NUM_EPOCHS = 1.0
+NUM_STEPS = None
+LEARNING_RATE = 1e-5          # <- từ 2e-4; liều nhẹ continue-train
+RESET_WEIGHTS = False         # <- từ True; NẠP adapter 0.86 thay vì fresh init
+SHUFFLE_DATASET = False       # <- giữ curated order
+# >>> EXP43_CONT END
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
-SHUFFLE_DATASET = False
+# >>> EXP43_GUARD START
+assert RESET_WEIGHTS is False, "batch-5 phải continue-train từ 0.86"
+assert LEARNING_RATE <= 1e-5, "batch-5 liều nhẹ"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP43_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -479,6 +488,19 @@ def run_training() -> None:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     print(f"  {trainable_params:,} trainable / {frozen_params:,} frozen")
+
+    # >>> EXP43 START
+    TRAIN_ONLY_MODULES = ("in_proj", "out_proj")   # khu trú Mamba mixer cho bit
+    if TRAIN_ONLY_MODULES:
+        _frozen_by_exp43 = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad and not any(m in name for m in TRAIN_ONLY_MODULES):
+                param.requires_grad = False
+                _frozen_by_exp43 += 1
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        print(f"EXP43: frozen {_frozen_by_exp43} extra params; now {trainable_params:,} trainable / {frozen_params:,} frozen")
+    # >>> EXP43 END
 
     # ── MoE tied-weight params (Tinker convention) ───────────────────
     # Tinker ties whichever LoRA side touches the hidden dim:

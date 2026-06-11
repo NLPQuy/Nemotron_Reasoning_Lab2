@@ -1,5 +1,11 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP54 START
+# EXP54 — MoSLoRA mixer (Batch-6 B6-14): learnable r×r subspace mixer M; fold B'=B·M at save.
+# Ref: refs/moslora layer.py:113/166/347. STATUS: NO-GO/near-free (maintainer 20-run = ngang LoRA);
+# run last, expect ~0. Init mixer = kaiming(a=sqrt(5)); scaling unchanged (alpha/r). Applied to NON-expert
+# LoRA modules only. Knob: MOSLORA=True | Rollback: MOSLORA=False. Deploy: after fold = rank-32 LoRA chuẩn.
+# >>> EXP54 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +14,27 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
+# >>> EXP_3EPOCH START — from-scratch: 3 full passes (see EXP_MULTIEPOCH in training loop)
+NUM_EPOCHS = 3.0  # train this many full passes over the corpus (auto-sized)
+# >>> EXP_3EPOCH END
 NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
+# >>> EXP54_CONT START   (FROM-SCRATCH — MoSLoRA là re-param, train fresh; B=0 ⇒ ΔW=0 lúc đầu)
+LEARNING_RATE = 2e-4          # recipe from-scratch gốc (đổi về 5e-6 nếu muốn continue)
+RESET_WEIGHTS = True          # <- True: fresh init (A=kaiming, B=0, mixer M=kaiming), KHÔNG nạp adapter
+# >>> EXP54_CONT END
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+# >>> EXP54_GUARD START
+assert RESET_WEIGHTS is True, "exp54 = from-scratch (MoSLoRA re-param)"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP54_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -385,6 +397,46 @@ def run_training() -> None:
 
     print("Verified: LoRA params fp32, base params bf16 (MoE router fp32)")
 
+    # >>> EXP54 START — B6-14 MoSLoRA mixer (non-expert modules). Fold B'=B·M at save.
+    import types
+    MOSLORA = True
+    _moslora_mods = []
+    if MOSLORA:
+        for _nm, _m in model.named_modules():
+            if ".experts." in _nm:
+                continue  # keep MoE-tie simple: mixer on non-expert modules only
+            if _nm.endswith("lm_head"):
+                continue  # CCE forward uses manual B@A path → lm_head.forward bypassed,
+                          # so its mixer M would never train; fold would corrupt lm_head.
+            if not (hasattr(_m, "lora_A") and hasattr(_m, "lora_B")):
+                continue
+            if "default" not in getattr(_m, "lora_A", {}):
+                continue
+            _r = _m.lora_A["default"].weight.shape[0]
+            _mix = torch.nn.Linear(_r, _r, bias=False).to(
+                _m.lora_A["default"].weight.device, torch.float32)
+            torch.nn.init.kaiming_uniform_(_mix.weight, a=math.sqrt(5))
+            _m.lora_AB = torch.nn.ModuleDict({"default": _mix})
+            _moslora_mods.append(_m)
+
+        def _moslora_forward(self, x, *args, **kwargs):
+            result = self.base_layer(x, *args, **kwargs)
+            _result_dtype = result.dtype  # keep base output dtype (bf16), NOT x.dtype
+            for adp in self.active_adapters:
+                if adp not in self.lora_A:
+                    continue
+                A, B = self.lora_A[adp], self.lora_B[adp]
+                M = self.lora_AB[adp]
+                drop = self.lora_dropout[adp]
+                xd = drop(x).to(A.weight.dtype)
+                result = result + B(M(A(xd))) * self.scaling[adp]
+            return result.to(_result_dtype)
+
+        for _m in _moslora_mods:
+            _m.forward = types.MethodType(_moslora_forward, _m)
+        print(f"EXP54 MoSLoRA: mixer added to {len(_moslora_mods)} non-expert modules")
+    # >>> EXP54 END
+
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Model: {trainable:,} trainable / {total:,} total parameters")
@@ -567,13 +619,11 @@ def run_training() -> None:
     num_steps = max(1, round(NUM_EPOCHS * max_steps))
     if NUM_STEPS is not None:
         num_steps = min(num_steps, NUM_STEPS)
-    if num_steps > max_steps:
-        _log(
-            f"WARNING: requested {num_steps} steps exceeds single-pass "
-            f"max_steps={max_steps} ({len(examples)} // {BATCH_SIZE}). "
-            f"Clamping to {max_steps}."
-        )
-        num_steps = max_steps
+    # >>> EXP_MULTIEPOCH START — allow up to NUM_EPOCHS passes (no single-pass clamp)
+    _total_avail = max_steps * math.ceil(NUM_EPOCHS)
+    if num_steps > _total_avail:
+        num_steps = _total_avail
+    # >>> EXP_MULTIEPOCH END
     _log(
         f"Auto steps: NUM_EPOCHS={NUM_EPOCHS}, steps/epoch={max_steps}, "
         f"num_steps={num_steps}, NUM_STEPS_cap={NUM_STEPS}"
@@ -586,7 +636,10 @@ def run_training() -> None:
     )
 
     step = 0
-    for batch_start in range(0, len(indices), BATCH_SIZE):
+    # >>> EXP_MULTIEPOCH START — repeat curated order NUM_EPOCHS times (keeps order, no shuffle)
+    _epoch_indices = indices * math.ceil(NUM_EPOCHS)
+    # >>> EXP_MULTIEPOCH END
+    for batch_start in range(0, len(_epoch_indices), BATCH_SIZE):
         if step >= num_steps:
             break
         # >>> EXP_TIME_GUARD START
@@ -597,7 +650,7 @@ def run_training() -> None:
             )
             break
         # >>> EXP_TIME_GUARD END
-        batch_indices = indices[batch_start : batch_start + BATCH_SIZE]
+        batch_indices = _epoch_indices[batch_start : batch_start + BATCH_SIZE]
         batch = [examples[i] for i in batch_indices]
         batch_tokens = [e["tokens"] for e in batch]
         batch_targets = [e["targets"] for e in batch]
@@ -653,14 +706,12 @@ def run_training() -> None:
                 weight_sum_t = padded_weights.abs().sum()
                 # >>> EXP_WEIGHT_SIGN END
                 loss_sum_t = weighted_loss.sum()
-                loss = (
-                    loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
-                )
-
-            (loss / n_accum).backward()
+            # >>> D5_ACCUM START — backward raw loss_sum; scale grads by 1/total_weight after batch (fix mean-of-means)
             total_loss_sum += loss_sum_t.item()
             total_weight_sum += weight_sum_t.item()
-            del loss, per_token_ce, weighted_loss
+            loss_sum_t.backward()
+            # >>> D5_ACCUM END
+            del loss_sum_t, per_token_ce, weighted_loss
 
             t_end = time.time()
             peak_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -680,14 +731,40 @@ def run_training() -> None:
                 eps=1e-8,
                 weight_decay=0.0,
             )
-        lr = LEARNING_RATE * (1 - step / num_steps)
+            # >>> D5_EMA START — init EMA shadow of trainable params
+            EMA_DECAY = 0.999
+            ema = {n: p.detach().float().clone() for n, p in model.named_parameters() if p.requires_grad}
+            # >>> D5_EMA END
+        # >>> D5_ACCUM START — scale accumulated grads by 1/total_weight (global mean)
+        if total_weight_sum > 0:
+            _scale = 1.0 / total_weight_sum
+            for _p in model.parameters():
+                if _p.requires_grad and _p.grad is not None:
+                    _p.grad.mul_(_scale)
+        # >>> D5_ACCUM END
+        # >>> D5_WARM START — 3% warmup + cosine→10% floor
+        _warmup = max(1, int(0.03 * num_steps))
+        if step < _warmup:
+            lr = LEARNING_RATE * (step + 1) / _warmup
+        else:
+            _prog = (step - _warmup) / max(1, num_steps - _warmup)
+            lr = LEARNING_RATE * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * _prog)))
+        # >>> D5_WARM END
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
+        # >>> D5_CLIP START — max_norm 1e9 → 1.0
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], max_norm=1e9
+            [p for p in model.parameters() if p.requires_grad], max_norm=1.0
         )
+        # >>> D5_CLIP END
         optimizer.step()
+        # >>> D5_EMA START — update EMA after optimizer step
+        with torch.no_grad():
+            for _n, _p in model.named_parameters():
+                if _p.requires_grad and _n in ema:
+                    ema[_n].mul_(EMA_DECAY).add_(_p.detach().float(), alpha=1 - EMA_DECAY)
+        # >>> D5_EMA END
         optimizer.zero_grad()
         loss_mean = total_loss_sum / total_weight_sum if total_weight_sum > 0 else 0
         step += 1
@@ -708,6 +785,22 @@ def run_training() -> None:
     for _f in os.listdir(save_dir):
         if _f.startswith("adapter"):
             os.remove(os.path.join(save_dir, _f))
+    # >>> D5_EMA START — ship EMA weights instead of last-step weights
+    print("Shipping EMA weights...")
+    with torch.no_grad():
+        for _n, _p in model.named_parameters():
+            if _p.requires_grad and _n in ema:
+                _p.copy_(ema[_n].to(_p.dtype))
+    # >>> D5_EMA END
+    # >>> EXP54 fold — B' = B·M so the saved adapter is plain rank-32 LoRA (vLLM-safe)
+    if MOSLORA:
+        with torch.no_grad():
+            for _m in _moslora_mods:
+                Bw = _m.lora_B["default"].weight    # [out, r]
+                Mw = _m.lora_AB["default"].weight    # [r, r]
+                Bw.copy_((Bw.float() @ Mw.float()).to(Bw.dtype))
+                del _m.lora_AB                        # drop mixer from state_dict
+    # >>> EXP54 fold END
     model.save_pretrained(save_dir)
     st_path = os.path.join(save_dir, "adapter_model.safetensors")
     tensors = load_file(st_path)

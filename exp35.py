@@ -1,5 +1,10 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP35 START
+# EXP35 - Short-tier bit length curriculum on top of solver-plus-RFT mix.
+# Knobs: continue adapter, LR=1e-5, NUM_STEPS=287, CORPUS_PATH=mix_length.
+# Rollback: drop H_lengthcur if held-out long bit-zero does not improve.
+# >>> EXP35 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,23 +13,28 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
+# >>> EXP35 START
 NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
 NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
+# >>> EXP35 END
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
+# >>> EXP35 START
+LEARNING_RATE = 1e-5
+RESET_WEIGHTS = False
+EXP35_MODAL_CORPUS_PATH = "/data/corpus/mix_length.jsonl"
+# >>> EXP35 END
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
-SHUFFLE_DATASET = False
+SHUFFLE_DATASET = True
 
-KAGGLE_DATASET = "huikang/nemotron-data"
+# >>> EXP35 START
+KAGGLE_DATASET = "huikang/nemotron-exp35-length"
+# >>> EXP35 END
 MINUTES = 60
 
 TARGET_MODULES = [
@@ -114,6 +124,9 @@ def run_training() -> None:
 
         CORPUS_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/tokens"
         TRAIN_ORDER_PATH = "/kaggle/input/datasets/huikang/huikang-nemotron-repository-snapshot/nemotron-master/training/sft/04-08-16-14/logprobs/index.jsonl"
+        # >>> EXP35 START
+        CORPUS_PATH = "/kaggle/input/datasets/ngoczhu/nemotron-mixes/mix_length.jsonl"
+        # >>> EXP35 END
         TRAIN_CSV_PATH = "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge/train.csv"
         # >>> KAGGLE_ADAPTER START
         # 0.86 adapter as loose Kaggle dataset (no unzip). ADAPTER_SRC is read-only
@@ -126,6 +139,9 @@ def run_training() -> None:
     else:  # IS_MODAL_WORKER
         MODEL_PATH = "unsloth/Nemotron-3-Nano-30B-A3B"
         CORPUS_PATH = "/data/corpus_preprocessed.jsonl"
+        # >>> EXP35 START
+        CORPUS_PATH = EXP35_MODAL_CORPUS_PATH
+        # >>> EXP35 END
         TRAIN_CSV_PATH = "/data/train.csv"
         ADAPTER_SRC = "/merged/weights"
         OUTPUT_DIR = "/output/weights"

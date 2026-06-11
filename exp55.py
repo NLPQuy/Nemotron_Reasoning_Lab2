@@ -1,5 +1,11 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Nemotron finetuning pipeline
+# >>> EXP55 START
+# EXP55 — embed_tokens free coverage (Batch-6 B6-19)
+# Ref: plan-batch-6.md §4bis (module-map tĩnh vLLM 0.12.0: embed_tokens ∈ embedding_modules)
+# Knob: EMBED_LORA=True (manual LoRA-Embedding, NOT in TARGET_MODULES) | Rollback: EMBED_LORA=False
+# Deploy: rank-32 LoRA-embedding chuẩn (lora_embedding_A/B), KHÔNG modules_to_save, strip full embed weight
+# >>> EXP55 END
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 # ── Shared config ─────────────────────────────────────────────────────
@@ -8,21 +14,27 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 MAX_SEQ_LEN = 8192
-NUM_EPOCHS = 1.0  # train this many full passes over the corpus (auto-sized)
+# >>> EXP_3EPOCH START — from-scratch: 3 full passes (see EXP_MULTIEPOCH in training loop)
+NUM_EPOCHS = 3.0  # train this many full passes over the corpus (auto-sized)
+# >>> EXP_3EPOCH END
 NUM_STEPS = None  # optional hard cap on auto-sized steps; None = pure epoch-based
 MAX_TRAIN_SECONDS = int(11.5 * 3600)  # wall-clock guard (Kaggle ~12h): stop training, emit submission
 BATCH_SIZE = 32
 MICRO_BATCH_SIZE = 4
-LEARNING_RATE = 2e-4
-RESET_WEIGHTS = (
-    True  # if True, skip loading pretrained adapter; train from fresh LoRA init
-)
+# >>> EXP55_CONT START   (FROM-SCRATCH — train fresh, không nạp 0.86)
+LEARNING_RATE = 2e-4          # recipe from-scratch gốc (đổi về 1e-5 nếu muốn continue)
+RESET_WEIGHTS = True          # <- True: fresh LoRA init (gồm embed_tokens), KHÔNG nạp 0.86
+# >>> EXP55_CONT END
 IN_PROJ_ONLY = False
 MOE_TIE_WEIGHTS = True  # if True, tie one side of MoE expert LoRA across all 128 experts (Tinker-style)
 ORIGINAL_PROBLEMS_ONLY = (
     False  # if True, filter examples to only problem_ids listed in train.csv
 )
 SHUFFLE_DATASET = False
+# >>> EXP55_GUARD START
+assert RESET_WEIGHTS is True, "exp55 = from-scratch (train embed fresh)"
+assert SHUFFLE_DATASET is False, "giữ curated order"
+# >>> EXP55_GUARD END
 
 KAGGLE_DATASET = "huikang/nemotron-data"
 MINUTES = 60
@@ -338,6 +350,43 @@ def run_training() -> None:
     else:
         print("lm_head already has LoRA")
 
+    # >>> EXP55 START — B6-19 embed_tokens free coverage (manual LoRA-Embedding).
+    # Added manually (NOT via TARGET_MODULES) so Unsloth can't promote embed to
+    # modules_to_save (full-weight embed → vLLM hard ValueError). _create_and_replace
+    # dispatches an nn.Embedding target to PEFT's LoRA Embedding → lora_embedding_A/B.
+    from peft.tuners.lora import Embedding as LoraEmbedding
+
+    EMBED_LORA = True
+    if EMBED_LORA:
+        # NemotronHModel names its input embedding `embeddings` (NOT `embed_tokens`);
+        # access via get_input_embeddings() and replace backbone.embeddings in place.
+        # DEPLOY-VERIFIED (vLLM v0.12.0 nemotron_h.py): hf_to_vllm_mapper maps
+        #   backbone->model and substr embeddings->embed_tokens, applied to LoRA too, so
+        #   key backbone.embeddings.lora_embedding_* -> model.embed_tokens.* which IS in
+        #   embedding_modules => vLLM applies the embedding LoRA (bf16, non-quantized). Do NOT rename.
+        _embed = _causal_lm.get_input_embeddings()
+        if not isinstance(_embed, LoraEmbedding):
+            _ecfg = LoraConfig(
+                r=LORA_RANK, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT
+            )
+            # PEFT requires current_key (module name) for pattern matching; no
+            # rank/alpha pattern set so the value only needs to be the real name.
+            _embed_key = next(
+                (n for n, m in model.named_modules() if m is _embed), "embeddings"
+            )
+            model.base_model._create_and_replace(
+                _ecfg,
+                "default",
+                target=_embed,
+                target_name="embeddings",
+                parent=_causal_lm.backbone,
+                current_key=_embed_key,
+            )
+            print(f"EXP55: manually added LoRA-Embedding to backbone.embeddings ({_embed_key})")
+        else:
+            print("EXP55: backbone.embeddings already has LoRA")
+    # >>> EXP55 END
+
     # ── Cast LoRA params to fp32 (base model stays bf16 except MoE router) ──
     for name, param in model.named_parameters():
         if ".lora_" in name:
@@ -567,13 +616,11 @@ def run_training() -> None:
     num_steps = max(1, round(NUM_EPOCHS * max_steps))
     if NUM_STEPS is not None:
         num_steps = min(num_steps, NUM_STEPS)
-    if num_steps > max_steps:
-        _log(
-            f"WARNING: requested {num_steps} steps exceeds single-pass "
-            f"max_steps={max_steps} ({len(examples)} // {BATCH_SIZE}). "
-            f"Clamping to {max_steps}."
-        )
-        num_steps = max_steps
+    # >>> EXP_MULTIEPOCH START — allow up to NUM_EPOCHS passes (no single-pass clamp)
+    _total_avail = max_steps * math.ceil(NUM_EPOCHS)
+    if num_steps > _total_avail:
+        num_steps = _total_avail
+    # >>> EXP_MULTIEPOCH END
     _log(
         f"Auto steps: NUM_EPOCHS={NUM_EPOCHS}, steps/epoch={max_steps}, "
         f"num_steps={num_steps}, NUM_STEPS_cap={NUM_STEPS}"
@@ -586,7 +633,10 @@ def run_training() -> None:
     )
 
     step = 0
-    for batch_start in range(0, len(indices), BATCH_SIZE):
+    # >>> EXP_MULTIEPOCH START — repeat curated order NUM_EPOCHS times (keeps order, no shuffle)
+    _epoch_indices = indices * math.ceil(NUM_EPOCHS)
+    # >>> EXP_MULTIEPOCH END
+    for batch_start in range(0, len(_epoch_indices), BATCH_SIZE):
         if step >= num_steps:
             break
         # >>> EXP_TIME_GUARD START
@@ -597,7 +647,7 @@ def run_training() -> None:
             )
             break
         # >>> EXP_TIME_GUARD END
-        batch_indices = indices[batch_start : batch_start + BATCH_SIZE]
+        batch_indices = _epoch_indices[batch_start : batch_start + BATCH_SIZE]
         batch = [examples[i] for i in batch_indices]
         batch_tokens = [e["tokens"] for e in batch]
         batch_targets = [e["targets"] for e in batch]
@@ -653,14 +703,12 @@ def run_training() -> None:
                 weight_sum_t = padded_weights.abs().sum()
                 # >>> EXP_WEIGHT_SIGN END
                 loss_sum_t = weighted_loss.sum()
-                loss = (
-                    loss_sum_t / weight_sum_t if weight_sum_t > 0 else loss_sum_t * 0.0
-                )
-
-            (loss / n_accum).backward()
+            # >>> D5_ACCUM START — backward raw loss_sum; scale grads by 1/total_weight after batch (fix mean-of-means)
             total_loss_sum += loss_sum_t.item()
             total_weight_sum += weight_sum_t.item()
-            del loss, per_token_ce, weighted_loss
+            loss_sum_t.backward()
+            # >>> D5_ACCUM END
+            del loss_sum_t, per_token_ce, weighted_loss
 
             t_end = time.time()
             peak_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -680,14 +728,40 @@ def run_training() -> None:
                 eps=1e-8,
                 weight_decay=0.0,
             )
-        lr = LEARNING_RATE * (1 - step / num_steps)
+            # >>> D5_EMA START — init EMA shadow of trainable params
+            EMA_DECAY = 0.999
+            ema = {n: p.detach().float().clone() for n, p in model.named_parameters() if p.requires_grad}
+            # >>> D5_EMA END
+        # >>> D5_ACCUM START — scale accumulated grads by 1/total_weight (global mean)
+        if total_weight_sum > 0:
+            _scale = 1.0 / total_weight_sum
+            for _p in model.parameters():
+                if _p.requires_grad and _p.grad is not None:
+                    _p.grad.mul_(_scale)
+        # >>> D5_ACCUM END
+        # >>> D5_WARM START — 3% warmup + cosine→10% floor
+        _warmup = max(1, int(0.03 * num_steps))
+        if step < _warmup:
+            lr = LEARNING_RATE * (step + 1) / _warmup
+        else:
+            _prog = (step - _warmup) / max(1, num_steps - _warmup)
+            lr = LEARNING_RATE * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * _prog)))
+        # >>> D5_WARM END
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         _tie_grads()  # average MoE expert grads before clip+step so Adam stays in sync
+        # >>> D5_CLIP START — max_norm 1e9 → 1.0
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], max_norm=1e9
+            [p for p in model.parameters() if p.requires_grad], max_norm=1.0
         )
+        # >>> D5_CLIP END
         optimizer.step()
+        # >>> D5_EMA START — update EMA after optimizer step
+        with torch.no_grad():
+            for _n, _p in model.named_parameters():
+                if _p.requires_grad and _n in ema:
+                    ema[_n].mul_(EMA_DECAY).add_(_p.detach().float(), alpha=1 - EMA_DECAY)
+        # >>> D5_EMA END
         optimizer.zero_grad()
         loss_mean = total_loss_sum / total_weight_sum if total_weight_sum > 0 else 0
         step += 1
@@ -708,12 +782,23 @@ def run_training() -> None:
     for _f in os.listdir(save_dir):
         if _f.startswith("adapter"):
             os.remove(os.path.join(save_dir, _f))
+    # >>> D5_EMA START — ship EMA weights instead of last-step weights
+    print("Shipping EMA weights...")
+    with torch.no_grad():
+        for _n, _p in model.named_parameters():
+            if _p.requires_grad and _n in ema:
+                _p.copy_(ema[_n].to(_p.dtype))
+    # >>> D5_EMA END
     model.save_pretrained(save_dir)
     st_path = os.path.join(save_dir, "adapter_model.safetensors")
     tensors = load_file(st_path)
     renamed = {
         k.replace("base_model.model.lm_head.", "base_model.model.backbone.lm_head."): v
         for k, v in tensors.items()
+        # >>> EXP55 strip: drop full embeddings base weight written by PEFT's
+        # save_embedding_layers="auto" (~700MB). Ship only lora_embedding_A/B delta.
+        if not k.endswith("backbone.embeddings.base_layer.weight")
+        # >>> EXP55 strip END
     }
     save_file(renamed, st_path)
 
